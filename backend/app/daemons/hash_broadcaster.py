@@ -35,7 +35,7 @@ class SequentialHashChainBroadcaster:
         self.database_url = database_url or os.getenv("AUDIT_REPLICA_DATABASE_URL", "")
         self.signing_key = signing_key or os.getenv("AUDIT_BROADCAST_HMAC_KEY", "")
         self.remote_webhook_url = remote_webhook_url or os.getenv("REMOTE_AUDIT_WEBHOOK_URL", "")
-        self.cursor_file_path = Path(cursor_file_path or os.getenv("CURSOR_FILE_PATH", ".cursor"))
+        self.cursor_file_path = Path(cursor_file_path or os.getenv("CURSOR_FILE_PATH", "/var/lib/attilan/broadcaster_cursor.json"))
         self.poll_interval_seconds = int(os.getenv("BROADCAST_INTERVAL_SECONDS", str(poll_interval_seconds)))
         self._shutdown_event = asyncio.Event()
 
@@ -44,7 +44,15 @@ class SequentialHashChainBroadcaster:
             return 0
         try:
             raw_text = self.cursor_file_path.read_text(encoding="utf-8").strip()
-            return int(raw_text) if raw_text else 0
+            if not raw_text:
+                return 0
+            try:
+                data = json.loads(raw_text)
+                if isinstance(data, dict):
+                    return int(data.get("last_leaf_index") or data.get("cursor") or 0)
+                return int(data)
+            except json.JSONDecodeError:
+                return int(raw_text)
         except (OSError, ValueError) as exc:
             logger.warning("Cursor read failed; retaining a zero cursor: %s", exc)
             return 0
@@ -52,7 +60,8 @@ class SequentialHashChainBroadcaster:
     def commit_cursor(self, last_index: int) -> None:
         self.cursor_file_path.parent.mkdir(parents=True, exist_ok=True)
         pending = self.cursor_file_path.with_suffix(".tmp")
-        pending.write_text(str(last_index), encoding="utf-8")
+        payload = json.dumps({"last_leaf_index": last_index}, indent=2)
+        pending.write_text(payload, encoding="utf-8")
         pending.replace(self.cursor_file_path)
 
     def compute_hmac_signature(self, payload: bytes) -> str:
@@ -67,32 +76,67 @@ class SequentialHashChainBroadcaster:
             await conn.execute("SET LOCAL ROLE audit_reader")
             records = await conn.fetch(
                 """
-                SELECT leaf_index, timestamp, action_type, target_table, target_uuid,
-                       actor_user_id, client_ip, preceding_leaf_hash, data_payload_hash,
-                       current_leaf_hash
+                SELECT leaf_index, timestamp, timestamp::text AS timestamp_raw,
+                       action_type, target_table, target_uuid,
+                       actor_user_id, client_ip, client_ip::text AS client_ip_raw,
+                       preceding_leaf_hash, data_payload_hash, current_leaf_hash
                 FROM audit_merkle_ledger
                 WHERE leaf_index > $1
-                ORDER BY leaf_index ASC;
+                ORDER BY leaf_index ASC
+                LIMIT 50;
                 """,
                 cursor_value,
             )
-        return [
-            {
-                "leaf_index": int(record["leaf_index"]),
-                "timestamp": record["timestamp"].isoformat()
-                if isinstance(record["timestamp"], datetime)
-                else str(record["timestamp"]),
-                "action_type": str(record["action_type"]),
-                "target_table": str(record["target_table"]),
-                "target_uuid": str(record["target_uuid"]),
-                "actor_user_id": str(record["actor_user_id"]),
-                "client_ip": str(record["client_ip"]),
-                "preceding_leaf_hash": str(record["preceding_leaf_hash"]).strip(),
-                "data_payload_hash": str(record["data_payload_hash"]).strip(),
-                "current_leaf_hash": str(record["current_leaf_hash"]).strip(),
-            }
-            for record in records
-        ]
+
+        verified_leaves: List[Dict[str, Any]] = []
+        for record in records:
+            leaf_index = int(record["leaf_index"])
+            ts_str = record["timestamp_raw"]
+            action_type = str(record["action_type"])
+            target_table = str(record["target_table"])
+            target_uuid = str(record["target_uuid"])
+            actor_user_id = str(record["actor_user_id"])
+            client_ip_str = record["client_ip_raw"]
+            data_payload_hash = str(record["data_payload_hash"]).strip()
+            preceding_leaf_hash = str(record["preceding_leaf_hash"]).strip()
+            stored_current_hash = str(record["current_leaf_hash"]).strip()
+
+            # Mathematically recalculate current_leaf_hash = SHA256(row metadata)
+            envelope = (
+                f"{leaf_index}{ts_str}{action_type}{target_table}"
+                f"{target_uuid}{actor_user_id}{client_ip_str}"
+                f"{data_payload_hash}{preceding_leaf_hash}"
+            )
+            recomputed_hash = hashlib.sha256(envelope.encode("utf-8")).hexdigest()
+
+            if recomputed_hash.lower() != stored_current_hash.lower():
+                logger.critical(
+                    "SECURITY INTEGRITY ALERT [P0-03]: Audit leaf %s hash mismatch! "
+                    "Expected %s, recalculated %s. Ledger tampering detected. Halting broadcast.",
+                    leaf_index,
+                    stored_current_hash,
+                    recomputed_hash,
+                )
+                break
+
+            verified_leaves.append(
+                {
+                    "leaf_index": leaf_index,
+                    "timestamp": record["timestamp"].isoformat()
+                    if isinstance(record["timestamp"], datetime)
+                    else str(record["timestamp"]),
+                    "action_type": action_type,
+                    "target_table": target_table,
+                    "target_uuid": target_uuid,
+                    "actor_user_id": actor_user_id,
+                    "client_ip": client_ip_str,
+                    "preceding_leaf_hash": preceding_leaf_hash,
+                    "data_payload_hash": data_payload_hash,
+                    "current_leaf_hash": stored_current_hash,
+                }
+            )
+
+        return verified_leaves
 
     async def broadcast_batch(self, client: httpx.AsyncClient, batch: List[Dict[str, Any]]) -> bool:
         if not self.remote_webhook_url or not self.signing_key:

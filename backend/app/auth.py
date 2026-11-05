@@ -16,6 +16,7 @@ class AuthenticatedUser:
     user_id: uuid.UUID
     clearances: FrozenSet[str]
     claims: dict[str, Any]
+    token_session_id: uuid.UUID
 
 
 def _decode_bearer_token(token: str) -> AuthenticatedUser:
@@ -48,7 +49,21 @@ def _decode_bearer_token(token: str) -> AuthenticatedUser:
     ):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="JWT lacks usable authorization clearances")
 
-    return AuthenticatedUser(user_id=user_id, clearances=frozenset(raw_clearances), claims=claims)
+    # Map cryptographically distinct token session ID
+    if "jti" in claims:
+        try:
+            token_session_id = uuid.UUID(str(claims["jti"]))
+        except Exception:
+            token_session_id = uuid.uuid5(uuid.NAMESPACE_OID, f"attilan:jwt:{token}")
+    else:
+        token_session_id = uuid.uuid5(uuid.NAMESPACE_OID, f"attilan:jwt:{token}")
+
+    return AuthenticatedUser(
+        user_id=user_id,
+        clearances=frozenset(raw_clearances),
+        claims=claims,
+        token_session_id=token_session_id,
+    )
 
 
 async def get_current_authenticated_user(

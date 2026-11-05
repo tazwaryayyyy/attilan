@@ -132,7 +132,27 @@ CREATE TABLE IF NOT EXISTS source_registry (
     blake3_hash CHAR(64) NOT NULL,
     uploaded_by_user_id UUID NOT NULL,
     source_signature BYTEA, -- Cryptographic provider signature if available
+    upload_status VARCHAR(64) NOT NULL DEFAULT 'UPLOAD_PENDING',
     CONSTRAINT unq_source_hash UNIQUE(sha256_hash)
+);
+
+ALTER TABLE source_registry ADD COLUMN IF NOT EXISTS upload_status VARCHAR(64) NOT NULL DEFAULT 'UPLOAD_PENDING';
+
+-- 2.1b Quarantine Intake (Unverified Submissions & Lacking Court Validation)
+CREATE TABLE IF NOT EXISTS quarantine_intake (
+    quarantine_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    parent_case_number VARCHAR(128),
+    event_type VARCHAR(64) NOT NULL,
+    thana_jurisdiction VARCHAR(128) NOT NULL,
+    district VARCHAR(64) NOT NULL DEFAULT 'Khulna',
+    event_date DATE NOT NULL,
+    primary_source_id UUID NOT NULL REFERENCES source_registry(source_id),
+    procedural_weight VARCHAR(64) NOT NULL DEFAULT 'AWAITING_VERIFICATION',
+    event_summary TEXT NOT NULL,
+    quarantine_status VARCHAR(64) NOT NULL DEFAULT 'AWAITING_VERIFICATION',
+    quarantine_reason TEXT NOT NULL,
+    submitted_by_user_id UUID NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 -- 2.2 Documented Events (FIRs, GDs, Bail Hearings, Charge Sheets)
@@ -197,8 +217,19 @@ CREATE TABLE IF NOT EXISTS entity_edges (
     authorized_by_key_1 UUID NOT NULL,
     authorized_by_key_2 UUID, -- Required for SAME_AS disambiguation link
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT chk_no_self_loop CHECK (source_entity_id <> target_entity_id)
+    CONSTRAINT chk_no_self_loop CHECK (source_entity_id <> target_entity_id),
+    CONSTRAINT chk_same_as_key2_not_null CHECK (relationship_type != 'SAME_AS' OR authorized_by_key_2 IS NOT NULL),
+    CONSTRAINT chk_distinct_authorizers CHECK (authorized_by_key_1 != authorized_by_key_2)
 );
+
+DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_same_as_key2_not_null') THEN
+        ALTER TABLE entity_edges ADD CONSTRAINT chk_same_as_key2_not_null CHECK (relationship_type != 'SAME_AS' OR authorized_by_key_2 IS NOT NULL);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'chk_distinct_authorizers') THEN
+        ALTER TABLE entity_edges ADD CONSTRAINT chk_distinct_authorizers CHECK (authorized_by_key_1 != authorized_by_key_2);
+    END IF;
+END $$;
 
 -- 2.6 Append-Only Tamper-Evident Sequential Hash Chain Ledger
 CREATE TABLE IF NOT EXISTS audit_merkle_ledger (
@@ -279,6 +310,7 @@ BEGIN
         v_payload_json := to_jsonb(NEW);
         
         IF v_target_table = 'source_registry' THEN v_target_uuid := NEW.source_id;
+        ELSIF v_target_table = 'quarantine_intake' THEN v_target_uuid := NEW.quarantine_id;
         ELSIF v_target_table = 'criminal_events' THEN v_target_uuid := NEW.event_id;
         ELSIF v_target_table = 'entities' THEN v_target_uuid := NEW.entity_id;
         ELSIF v_target_table = 'event_assertions' THEN v_target_uuid := NEW.assertion_id;
@@ -294,6 +326,7 @@ BEGIN
         );
 
         IF v_target_table = 'source_registry' THEN v_target_uuid := NEW.source_id;
+        ELSIF v_target_table = 'quarantine_intake' THEN v_target_uuid := NEW.quarantine_id;
         ELSIF v_target_table = 'criminal_events' THEN 
             v_target_uuid := NEW.event_id;
             IF NOT (NEW.is_superseded = TRUE AND NEW.legal_justification IS NOT NULL) THEN
@@ -325,8 +358,8 @@ BEGIN
     -- Predict next sequence index
     v_next_index := nextval(pg_get_serial_sequence('audit_merkle_ledger', 'leaf_index'));
 
-    -- Calculate Current Leaf Hash = SHA256(leaf_index || timestamp || preceding_leaf_hash || data_payload_hash)
-    v_combined_payload := v_next_index::TEXT || v_now::TEXT || v_prev_leaf_hash || v_payload_hash;
+    -- Calculate Current Leaf Hash = SHA256(leaf_index || timestamp || action_type || target_table || target_uuid || actor_user_id || client_ip || data_payload_hash || preceding_leaf_hash)
+    v_combined_payload := v_next_index::TEXT || v_now::TEXT || v_action_type || v_target_table || v_target_uuid::TEXT || v_actor_user_id::TEXT || v_client_ip::TEXT || v_payload_hash || v_prev_leaf_hash;
     v_current_leaf_hash := encode(digest(v_combined_payload, 'sha256'), 'hex');
 
     -- Insert into immutable sequential hash-chain ledger
@@ -388,6 +421,94 @@ DROP TRIGGER IF EXISTS trg_hash_chain_entity_edges ON entity_edges;
 CREATE TRIGGER trg_hash_chain_entity_edges
     AFTER INSERT OR UPDATE ON entity_edges
     FOR EACH ROW EXECUTE FUNCTION process_sequential_hash_chain_event();
+
+DROP TRIGGER IF EXISTS trg_hash_chain_quarantine_intake ON quarantine_intake;
+CREATE TRIGGER trg_hash_chain_quarantine_intake
+    AFTER INSERT OR UPDATE ON quarantine_intake
+    FOR EACH ROW EXECUTE FUNCTION process_sequential_hash_chain_event();
+
+CREATE OR REPLACE FUNCTION log_sensitive_export_audit(
+    p_target_table VARCHAR(64),
+    p_target_uuid UUID,
+    p_export_format VARCHAR(32) DEFAULT 'json'
+) RETURNS VOID AS $$
+DECLARE
+    v_prev_leaf_hash CHAR(64);
+    v_payload_hash CHAR(64);
+    v_actor_user_id UUID;
+    v_client_ip INET;
+    v_next_index BIGINT;
+    v_now TIMESTAMPTZ;
+    v_combined_payload TEXT;
+    v_current_leaf_hash CHAR(64);
+    v_genesis_hash CHAR(64) := '0000000000000000000000000000000000000000000000000000000000000000';
+    v_payload_json JSONB;
+BEGIN
+    v_now := clock_timestamp();
+    v_actor_user_id := app.current_actor_id();
+    IF v_actor_user_id IS NULL THEN
+        RAISE EXCEPTION 'RLS CONTEXT MISSING: app.current_actor_id is required.';
+    END IF;
+
+    BEGIN
+        v_client_ip := NULLIF(current_setting('app.client_ip', true), '')::INET;
+    EXCEPTION WHEN OTHERS THEN
+        v_client_ip := NULL;
+    END;
+    IF v_client_ip IS NULL THEN
+        v_client_ip := COALESCE(inet_client_addr(), '0.0.0.0'::INET);
+    END IF;
+
+    v_payload_json := jsonb_build_object(
+        'action', 'SENSITIVE_EXPORT',
+        'target_table', p_target_table,
+        'target_uuid', p_target_uuid,
+        'format', p_export_format,
+        'actor', v_actor_user_id
+    );
+    v_payload_hash := encode(digest(v_payload_json::TEXT, 'sha256'), 'hex');
+
+    PERFORM 1 FROM hash_chain_mutex WHERE id = 1 FOR UPDATE;
+
+    SELECT current_leaf_hash INTO v_prev_leaf_hash
+    FROM audit_merkle_ledger
+    ORDER BY leaf_index DESC
+    LIMIT 1;
+
+    IF v_prev_leaf_hash IS NULL THEN
+        v_prev_leaf_hash := v_genesis_hash;
+    END IF;
+
+    v_next_index := nextval(pg_get_serial_sequence('audit_merkle_ledger', 'leaf_index'));
+
+    v_combined_payload := v_next_index::TEXT || v_now::TEXT || 'SENSITIVE_EXPORT' || p_target_table || p_target_uuid::TEXT || v_actor_user_id::TEXT || v_client_ip::TEXT || v_payload_hash || v_prev_leaf_hash;
+    v_current_leaf_hash := encode(digest(v_combined_payload, 'sha256'), 'hex');
+
+    INSERT INTO audit_merkle_ledger (
+        leaf_index,
+        timestamp,
+        action_type,
+        target_table,
+        target_uuid,
+        actor_user_id,
+        client_ip,
+        preceding_leaf_hash,
+        data_payload_hash,
+        current_leaf_hash
+    ) VALUES (
+        v_next_index,
+        v_now,
+        'SENSITIVE_EXPORT',
+        p_target_table,
+        p_target_uuid,
+        v_actor_user_id,
+        v_client_ip,
+        v_prev_leaf_hash,
+        v_payload_hash,
+        v_current_leaf_hash
+    );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, app;
 
 --------------------------------------------------------------------------------
 -- 4. Native Hard-Delete Prevention Triggers (Section 16: RT-02)
@@ -483,6 +604,7 @@ CREATE EVENT TRIGGER trg_block_audit_drop
 --------------------------------------------------------------------------------
 
 ALTER TABLE source_registry ENABLE ROW LEVEL SECURITY;
+ALTER TABLE quarantine_intake ENABLE ROW LEVEL SECURITY;
 ALTER TABLE criminal_events ENABLE ROW LEVEL SECURITY;
 ALTER TABLE entities ENABLE ROW LEVEL SECURITY;
 ALTER TABLE event_assertions ENABLE ROW LEVEL SECURITY;
@@ -496,18 +618,20 @@ REVOKE ALL ON ALL TABLES IN SCHEMA public FROM PUBLIC;
 REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;
 REVOKE ALL ON TABLE audit_merkle_ledger FROM api_worker, audit_reader;
 REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE audit_merkle_ledger FROM api_worker, audit_reader;
-REVOKE DELETE, TRUNCATE ON source_registry, criminal_events, entities, event_assertions, entity_edges FROM api_worker;
+REVOKE DELETE, TRUNCATE ON source_registry, quarantine_intake, criminal_events, entities, event_assertions, entity_edges FROM api_worker;
 
 GRANT USAGE ON SCHEMA public, app TO api_worker, audit_reader;
-GRANT SELECT, INSERT, UPDATE ON source_registry, criminal_events, entities, event_assertions, entity_edges TO api_worker;
+GRANT SELECT, INSERT, UPDATE ON source_registry, quarantine_intake, criminal_events, entities, event_assertions, entity_edges TO api_worker;
 GRANT SELECT ON audit_merkle_ledger TO api_worker, audit_reader;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO api_worker;
 GRANT EXECUTE ON FUNCTION app.current_actor_id() TO api_worker;
 GRANT EXECUTE ON FUNCTION app.has_clearance(TEXT) TO api_worker;
+GRANT EXECUTE ON FUNCTION log_sensitive_export_audit(VARCHAR, UUID, VARCHAR) TO api_worker;
 
 -- FORCE RLS so ownership cannot silently bypass policies on criminal data.
 -- audit_merkle_ledger is excluded: SECURITY DEFINER hash-chain triggers must append as db_owner.
 ALTER TABLE source_registry FORCE ROW LEVEL SECURITY;
+ALTER TABLE quarantine_intake FORCE ROW LEVEL SECURITY;
 ALTER TABLE criminal_events FORCE ROW LEVEL SECURITY;
 ALTER TABLE entities FORCE ROW LEVEL SECURITY;
 ALTER TABLE event_assertions FORCE ROW LEVEL SECURITY;
@@ -525,8 +649,19 @@ CREATE POLICY source_insert ON source_registry FOR INSERT TO api_worker
     WITH CHECK (app.has_clearance('evidence:ingest') AND uploaded_by_user_id = app.current_actor_id());
 DROP POLICY IF EXISTS source_update ON source_registry;
 CREATE POLICY source_update ON source_registry FOR UPDATE TO api_worker
-    USING (app.has_clearance('evidence:write'))
-    WITH CHECK (app.has_clearance('evidence:write'));
+    USING (app.has_clearance('evidence:write') OR app.has_clearance('evidence:ingest'))
+    WITH CHECK (app.has_clearance('evidence:write') OR app.has_clearance('evidence:ingest'));
+
+DROP POLICY IF EXISTS quarantine_read ON quarantine_intake;
+CREATE POLICY quarantine_read ON quarantine_intake FOR SELECT TO api_worker
+    USING (app.has_clearance('criminal:read') OR app.has_clearance('criminal:write'));
+DROP POLICY IF EXISTS quarantine_write ON quarantine_intake;
+CREATE POLICY quarantine_write ON quarantine_intake FOR INSERT TO api_worker
+    WITH CHECK (app.has_clearance('criminal:write'));
+DROP POLICY IF EXISTS quarantine_update ON quarantine_intake;
+CREATE POLICY quarantine_update ON quarantine_intake FOR UPDATE TO api_worker
+    USING (app.has_clearance('criminal:write'))
+    WITH CHECK (app.has_clearance('criminal:write'));
 
 DROP POLICY IF EXISTS events_read ON criminal_events;
 CREATE POLICY events_read ON criminal_events FOR SELECT TO api_worker
@@ -585,6 +720,7 @@ CREATE POLICY rls_deny_delete_merkle_ledger ON audit_merkle_ledger FOR DELETE TO
 -- Ownership exists only to run schema migrations and SECURITY DEFINER triggers;
 -- db_owner cannot log in, so ownership does not create an application bypass.
 ALTER TABLE source_registry OWNER TO db_owner;
+ALTER TABLE quarantine_intake OWNER TO db_owner;
 ALTER TABLE criminal_events OWNER TO db_owner;
 ALTER TABLE entities OWNER TO db_owner;
 ALTER TABLE event_assertions OWNER TO db_owner;
@@ -595,6 +731,7 @@ ALTER SEQUENCE audit_merkle_ledger_leaf_index_seq OWNER TO db_owner;
 ALTER FUNCTION app.current_actor_id() OWNER TO db_owner;
 ALTER FUNCTION app.has_clearance(TEXT) OWNER TO db_owner;
 ALTER FUNCTION process_sequential_hash_chain_event() OWNER TO db_owner;
+ALTER FUNCTION log_sensitive_export_audit(VARCHAR, UUID, VARCHAR) OWNER TO db_owner;
 ALTER FUNCTION enforce_criminal_events_soft_tombstone() OWNER TO db_owner;
 ALTER FUNCTION enforce_source_registry_delete_block() OWNER TO db_owner;
 ALTER FUNCTION protect_audit_ledger() OWNER TO db_owner;

@@ -57,7 +57,7 @@ The system is tested against active insider collusion, compromised credentials, 
 We welcome responsible security disclosures from the research community. If you discover a vulnerability in Attilan:
 
 1. **Do not create a public GitHub issue.**
-2. Send a PGP-encrypted report to the designated security response team at `security@attilan-defense.org`.
+2. Send a PGP-encrypted report to the designated security response team at `tazwardevp@gmail.com`[temp].
 3. Include:
    - Vulnerability class and potential impact.
    - Proof of Concept (PoC) code or step-by-step reproduction instructions.

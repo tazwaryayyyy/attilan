@@ -28,20 +28,26 @@ class DisambiguationCandidate(BaseModel):
         default_factory=list,
         description="Explicit properties that triggered contradiction (e.g. ['father_name', 'thana'])",
     )
+    insufficient_data: bool = Field(
+        default=False,
+        description="Explicitly flagged if Father Name or Thana are null/missing in one candidate (no 0.5 base score inflation)",
+    )
+    father_name_insufficient_data: bool = Field(
+        default=False,
+        description="True if Father Name is null or missing in either candidate",
+    )
+    thana_insufficient_data: bool = Field(
+        default=False,
+        description="True if Thana jurisdiction is null or missing in either candidate",
+    )
 
 
 class BengaliPhoneticEngine:
     """
     Unicode Normalizer and Bengali Phonetic Encoder adhering to res gotham.md Section 8.4.
-    Standardizes honorifics, removes ZWJ/ZWNJ, and generates normalized phonetic keys.
+    Adheres strictly to P0-04: Strips all name collapse dicts (e.g. মাহমুদ -> মোহাম্মদ).
+    Uses ONLY Unicode NFC normalization and regex punctuation stripping.
     """
-
-    HONORIFIC_MAPPINGS = {
-        r"^(md\.|md|mohammed|muhammad|mohammad)(\s+|$)": "mohammad ",
-        r"^(মোঃ|মুহাম্মদ|মুহম্মদ|মাহমুদ)(\s+|$)": "মোহাম্মদ ",
-        r"^(mst\.|mosammat|most\.)(\s+|$)": "mosammat ",
-        r"^(মোসাঃ|মোসাম্মৎ)(\s+|$)": "মোসাম্মৎ ",
-    }
 
     @classmethod
     def normalize_text(cls, text: str) -> str:
@@ -51,27 +57,20 @@ class BengaliPhoneticEngine:
         normalized = unicodedata.normalize("NFC", text.strip())
         # 2. Strip Zero-Width Joiner (\u200d) and Zero-Width Non-Joiner (\u200c)
         normalized = re.sub(r"[\u200c\u200d\u200e\u200f\ufeff]", "", normalized)
-        # 3. Lowercase English strings and trim excessive whitespace
-        normalized = re.sub(r"\s+", " ", normalized).lower()
-
-        # 4. Standardize Bengali-English transliteration phonetic variants
-        normalized = normalized.replace("q", "k")
-        normalized = normalized.replace("z", "j")
-        normalized = normalized.replace("ph", "f")
-
-        # 4. Standardize Bengali & English honorific prefixes
-        for pattern, replacement in cls.HONORIFIC_MAPPINGS.items():
-            normalized = re.sub(pattern, replacement, normalized)
-
-        return re.sub(r"\s+", " ", normalized).strip()
+        # 3. Strip regex punctuation and trim excessive whitespace (retaining Bengali and alphanumeric)
+        normalized = re.sub(r"[^\w\s\u0980-\u09FF]", " ", normalized)
+        return re.sub(r"\s+", " ", normalized).lower().strip()
 
     @classmethod
     def generate_phonetic_hash(cls, text: str) -> str:
         """
         Generates phonetic representation for Bengali characters:
-        Maps orthographic variants (যেমন: শ/ষ/স, ণ/ন, ই/ঈ, উ/ঊ) to canonical phonetic representations.
+        Maps orthographic variants (যেমন: শ/ষ/স, ণ/ন, ই/ঈ, উ/ঊ) to canonical phonetic representations
+        without collapsing distinct identities.
         """
         norm = cls.normalize_text(text)
+        # Transliteration phonetic normalization without semantic name collapses
+        norm = norm.replace("q", "k").replace("z", "j").replace("ph", "f")
         # Map similar phonemes in Bengali script
         phonetic_map = {
             "শ": "স",
@@ -156,8 +155,13 @@ class BengaliDisambiguationEvaluator:
         phonetic_2 = BengaliPhoneticEngine.generate_phonetic_hash(name_bn_2)
 
         name_sim = SequenceMatcher(None, phonetic_1, phonetic_2).ratio()
-        father_sim = cls.string_similarity(father_name_bn_1, father_name_bn_2)
-        thana_score = cls.thana_similarity(thana_1, thana_2)
+
+        # Check for missing/null attributes (prevent uncalibrated 0.5 base score inflation)
+        father_name_missing = not (father_name_bn_1 and father_name_bn_1.strip()) or not (father_name_bn_2 and father_name_bn_2.strip())
+        thana_missing = not (thana_1 and thana_1.strip()) or not (thana_2 and thana_2.strip())
+
+        father_sim = 0.0 if father_name_missing else cls.string_similarity(father_name_bn_1, father_name_bn_2)
+        thana_score = 0.0 if thana_missing else cls.thana_similarity(thana_1, thana_2)
         age_score = cls.age_proximity(age_1, age_2)
 
         composite = (
@@ -167,12 +171,14 @@ class BengaliDisambiguationEvaluator:
             + (age_score * cls.WEIGHT_AGE)
         )
 
-        # Divergence block threshold: If father names exist and diverge severely, or thanas are completely distinct
+        # Divergence block threshold: Only triggers if attributes exist in both candidates and contradict
         divergence_flags: List[str] = []
-        if father_name_bn_1 and father_name_bn_2 and father_sim < 0.50:
+        if not father_name_missing and father_sim < 0.50:
             divergence_flags.append("father_name")
-        if thana_1 and thana_2 and thana_score == 0.0:
+        if not thana_missing and thana_score == 0.0:
             divergence_flags.append("thana")
+
+        insufficient_data = father_name_missing or thana_missing
 
         if len(divergence_flags) > 0:
             status_text = "TREATED AS DISTINCT ENTITY (CRITICAL DIVERGENCE DETECTED)"
@@ -202,6 +208,9 @@ class BengaliDisambiguationEvaluator:
             adjudication_status=status_text,
             action=action,
             divergence_flags=divergence_flags,
+            insufficient_data=insufficient_data,
+            father_name_insufficient_data=father_name_missing,
+            thana_insufficient_data=thana_missing,
         )
 
 

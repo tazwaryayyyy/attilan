@@ -16,12 +16,9 @@ export const SoftTombstoneModal: React.FC<SoftTombstoneModalProps> = ({
   onClose,
   onSuccess,
 }) => {
-  const [legalJustification, setLegalJustification] = useState(
-    'Certified Judicial Decree: Sessions Case No. 45/2026, Khulna Sessions Judge Court.',
-  );
-  const [newSummary, setNewSummary] = useState(
-    'Sessions Court examined prosecution witnesses and ruled allegations unsubstantiated.',
-  );
+  const [legalJustification, setLegalJustification] = useState('');
+  const [dispositionDate, setDispositionDate] = useState('');
+  const [newSummary, setNewSummary] = useState('');
   const [courtOrderSourceId, setCourtOrderSourceId] = useState('');
   const [newWeight, setNewWeight] = useState('JUDICIAL_ACQUITTAL');
   const [submitting, setSubmitting] = useState(false);
@@ -35,11 +32,28 @@ export const SoftTombstoneModal: React.FC<SoftTombstoneModalProps> = ({
       setFault('Verified bearer token required. Client-supplied actor UUIDs are rejected.');
       return;
     }
+
+    const targetEventId = document.event_id || (document as any).event_id;
+    if (!targetEventId) {
+      setFault('Evidentiary violation: Target event_id is required. Submitting source_id is prohibited.');
+      return;
+    }
+
+    if (!legalJustification.trim()) {
+      setFault('Statutory legal justification is required. Automated defaults are rejected.');
+      return;
+    }
+
+    if (!dispositionDate.trim()) {
+      setFault('Court disposition date is required.');
+      return;
+    }
+
     setSubmitting(true);
     setFault(null);
 
     try {
-      const response = await fetch(`/api/events/${document.source_id}/tombstone_and_supersede`, {
+      const response = await fetch(`/api/events/${targetEventId}/tombstone_and_supersede`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -51,7 +65,7 @@ export const SoftTombstoneModal: React.FC<SoftTombstoneModalProps> = ({
           new_event_type: 'JUDICIAL_VERDICT',
           new_procedural_weight: newWeight,
           new_event_summary: newSummary,
-          new_event_date: new Date().toISOString().split('T')[0],
+          new_event_date: dispositionDate,
         }),
       });
       if (!response.ok) {
@@ -92,6 +106,16 @@ export const SoftTombstoneModal: React.FC<SoftTombstoneModalProps> = ({
               rows={2}
               value={legalJustification}
               onChange={(e) => setLegalJustification(e.target.value)}
+              placeholder="Enter authenticated judicial decree citation (human entry required)"
+            />
+          </label>
+          <label>
+            <span>DISPOSITION DATE</span>
+            <input
+              required
+              type="date"
+              value={dispositionDate}
+              onChange={(e) => setDispositionDate(e.target.value)}
             />
           </label>
           <label>
@@ -113,7 +137,13 @@ export const SoftTombstoneModal: React.FC<SoftTombstoneModalProps> = ({
           </label>
           <label>
             <span>ACTIVE V2 SUMMARY</span>
-            <textarea required rows={3} value={newSummary} onChange={(e) => setNewSummary(e.target.value)} />
+            <textarea
+              required
+              rows={3}
+              value={newSummary}
+              onChange={(e) => setNewSummary(e.target.value)}
+              placeholder="Enter verified judicial disposition summary"
+            />
           </label>
 
           {fault && (

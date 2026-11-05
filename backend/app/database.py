@@ -30,6 +30,14 @@ class DatabaseManager:
             await self.pool.close()
             self.pool = None
 
+    async def execute(self, query: str, *args: object) -> str:
+        """Executes a query directly on a pooled connection (e.g. for ping/healthcheck)."""
+        if not self.pool:
+            await self.connect()
+        assert self.pool is not None
+        async with self.pool.acquire() as conn:
+            return await conn.execute(query, *args)
+
     @asynccontextmanager
     async def connection(
         self,

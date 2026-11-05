@@ -52,11 +52,15 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
       MINIO_EVIDENCE_BUCKET: ${MINIO_EVIDENCE_BUCKET:?set MINIO_EVIDENCE_BUCKET in .env}
+      MINIO_API_USER: ${MINIO_API_USER:-attilan_api}
+      MINIO_API_PASSWORD: ${MINIO_API_PASSWORD:?set MINIO_API_PASSWORD in .env}
     entrypoint: >
       /bin/sh -ec "
       until /usr/bin/mc alias set attilan http://minio_worm:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do sleep 2; done;
       /usr/bin/mc mb --with-lock attilan/$$MINIO_EVIDENCE_BUCKET || true;
       /usr/bin/mc retention set --default COMPLIANCE 3650d attilan/$$MINIO_EVIDENCE_BUCKET || true;
+      /usr/bin/mc admin user add attilan $$MINIO_API_USER $$MINIO_API_PASSWORD || true;
+      /usr/bin/mc admin policy attach attilan readwrite --user $$MINIO_API_USER || true;
       "
 
   fastapi_engine:
@@ -84,8 +88,8 @@ services:
       ENVIRONMENT: production
       DATABASE_URL: postgresql://api_worker_login:${API_WORKER_PASSWORD:?set API_WORKER_PASSWORD in .env}@db_core:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}
       MINIO_ENDPOINT: minio_worm:9000
-      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
-      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      MINIO_ACCESS_KEY: ${MINIO_API_USER:-attilan_api}
+      MINIO_SECRET_KEY: ${MINIO_API_PASSWORD:?set MINIO_API_PASSWORD in .env}
       MINIO_SECURE: "false"
       MINIO_EVIDENCE_BUCKET: ${MINIO_EVIDENCE_BUCKET:?set MINIO_EVIDENCE_BUCKET in .env}
       JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env}
@@ -119,12 +123,14 @@ services:
     depends_on:
       db_core:
         condition: service_healthy
+    volumes:
+      - broadcaster_data:/var/lib/attilan
     environment:
       AUDIT_REPLICA_DATABASE_URL: postgresql://audit_replica_login:${AUDIT_REPLICA_PASSWORD:?set AUDIT_REPLICA_PASSWORD in .env}@db_core:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}
       AUDIT_BROADCAST_HMAC_KEY: ${AUDIT_BROADCAST_HMAC_KEY:?set AUDIT_BROADCAST_HMAC_KEY in .env}
       REMOTE_AUDIT_WEBHOOK_URL: ${REMOTE_AUDIT_WEBHOOK_URL:?set REMOTE_AUDIT_WEBHOOK_URL in .env}
       BROADCAST_INTERVAL_SECONDS: "300"
-      CURSOR_FILE_PATH: /tmp/.hash-broadcaster.cursor
+      CURSOR_FILE_PATH: /var/lib/attilan/broadcaster_cursor.json
 
   frontend_ui:
     build:
@@ -162,3 +168,4 @@ services:
 volumes:
   postgres_data:
   minio_data:
+  broadcaster_data:

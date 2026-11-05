@@ -1,7 +1,7 @@
 from typing import List, Optional
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
 from backend.app.database import db_manager
@@ -17,6 +17,16 @@ from backend.app.services.disambiguation import (
 )
 
 router = APIRouter(prefix="/entity", tags=["Entity Resolution & Disambiguation"])
+
+
+class EntitySearchResult(BaseModel):
+    entity_id: uuid.UUID
+    primary_name_bn: str
+    primary_name_en: str
+    father_name_bn: Optional[str] = None
+    thana_jurisdiction: Optional[str] = None
+    age: Optional[int] = None
+    match_score: float
 
 
 class DisambiguationQuery(BaseModel):
@@ -64,6 +74,62 @@ class ConflictResolutionResponse(BaseModel):
     message: str
 
 
+@router.get("/search", response_model=List[EntitySearchResult])
+async def search_entities(
+    q: str = Query(..., min_length=1, description="Bengali or English name search query"),
+    limit: int = Query(default=100, ge=1, le=1000, description="Pagination limit"),
+    offset: int = Query(default=0, ge=0, description="Pagination offset"),
+    request: Request = None,
+    current_user: AuthenticatedUser = Depends(require_clearance("entity:read")),
+) -> List[EntitySearchResult]:
+    """
+    Search entities using PostgreSQL pg_trgm trigram indexing without blind LIMIT 50 boundaries.
+    Results are sorted dynamically by match similarity.
+    """
+    client_ip = request.client.host if request and request.client else "127.0.0.1"
+
+    async with db_manager.connection(
+        actor_user_id=current_user.user_id,
+        actor_clearances=current_user.clearances,
+        client_ip=client_ip,
+    ) as conn:
+        rows = await conn.fetch(
+            """
+            SELECT entity_id, primary_name_bn, primary_name_en, father_name_bn,
+                   thana_jurisdiction, age,
+                   GREATEST(
+                       similarity(primary_name_bn, $1),
+                       similarity(COALESCE(primary_name_en, ''), $1)
+                   ) AS match_score
+            FROM entities
+            WHERE is_identity_disputed = FALSE
+              AND (
+                  primary_name_bn % $1
+                  OR COALESCE(primary_name_en, '') % $1
+                  OR similarity(primary_name_bn, $1) > 0.15
+                  OR similarity(COALESCE(primary_name_en, ''), $1) > 0.15
+              )
+            ORDER BY match_score DESC
+            OFFSET $2 LIMIT $3;
+            """,
+            q,
+            offset,
+            limit,
+        )
+        return [
+            EntitySearchResult(
+                entity_id=row["entity_id"],
+                primary_name_bn=row["primary_name_bn"],
+                primary_name_en=row["primary_name_en"] or "",
+                father_name_bn=row["father_name_bn"],
+                thana_jurisdiction=row["thana_jurisdiction"],
+                age=row["age"],
+                match_score=float(row["match_score"] or 0.0),
+            )
+            for row in rows
+        ]
+
+
 @router.post("/evaluate_disambiguation", response_model=DisambiguationQueueResponse)
 async def evaluate_disambiguation_queue(
     payload: DisambiguationQuery,
@@ -72,6 +138,7 @@ async def evaluate_disambiguation_queue(
 ) -> DisambiguationQueueResponse:
     """
     Computes Bengali phonetic and multi-attribute similarity against existing entity pool.
+    Passes through indexed trigram search without arbitrary LIMIT 50 truncation.
     Returns queue of candidate matches.
     CRITICAL: Does NOT merge underlying records under any circumstances.
     """
@@ -84,15 +151,30 @@ async def evaluate_disambiguation_queue(
         actor_clearances=current_user.clearances,
         client_ip=client_ip,
     ) as conn:
-        # Query potential matches using phonetic hash or trigram similarity
+        # Query potential matches using pg_trgm trigram index without blind LIMIT 50
+        query_bn = payload.primary_name_bn.strip()
+        query_en = (payload.primary_name_en or "").strip()
         rows = await conn.fetch(
             """
             SELECT entity_id, primary_name_bn, primary_name_en, father_name_bn,
-                   thana_jurisdiction, age
+                   thana_jurisdiction, age,
+                   GREATEST(
+                       similarity(primary_name_bn, $1),
+                       similarity(COALESCE(primary_name_en, ''), $2)
+                   ) AS trgm_sim
             FROM entities
             WHERE is_identity_disputed = FALSE
-            LIMIT 50;
-            """
+              AND (
+                  $1 = ''
+                  OR primary_name_bn % $1
+                  OR COALESCE(primary_name_en, '') % $2
+                  OR similarity(primary_name_bn, $1) > 0.15
+                  OR similarity(COALESCE(primary_name_en, ''), $2) > 0.15
+              )
+            ORDER BY trgm_sim DESC;
+            """,
+            query_bn,
+            query_en,
         )
 
         for row in rows:
@@ -151,19 +233,20 @@ async def resolve_disambiguation_conflict(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Second approver lacks entity:resolve clearance.",
         )
-    if primary_user.user_id == secondary_user.user_id:
+    if primary_user.user_id == secondary_user.user_id or primary_user.token_session_id == secondary_user.token_session_id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="SECURITY RESTRICTION: Two independently authenticated human principals are required.",
         )
 
-    user1_uuid = primary_user.user_id
-    user2_uuid = secondary_user.user_id
+    # Bind cryptographically distinct token session IDs directly to SQL
+    key1_session_id = primary_user.token_session_id
+    key2_session_id = secondary_user.token_session_id
 
     client_ip = request.client.host if request.client else "127.0.0.1"
 
     async with db_manager.connection(
-        actor_user_id=user1_uuid,
+        actor_user_id=primary_user.user_id,
         actor_clearances=primary_user.clearances,
         client_ip=client_ip,
     ) as conn:
@@ -213,8 +296,8 @@ async def resolve_disambiguation_conflict(
             payload.contextual_label,
             payload.source_document_id,
             payload.confidence_score,
-            user1_uuid,
-            user2_uuid,
+            key1_session_id,
+            key2_session_id,
         )
 
         return ConflictResolutionResponse(
@@ -223,8 +306,8 @@ async def resolve_disambiguation_conflict(
             target_entity_id=payload.entity_b_id,
             relationship_type="SAME_AS",
             contextual_label=payload.contextual_label,
-            authorized_by_key_1=str(user1_uuid),
-            authorized_by_key_2=str(user2_uuid),
+            authorized_by_key_1=str(key1_session_id),
+            authorized_by_key_2=str(key2_session_id),
             status="EDGE_LINKED_RECORDS_PRESERVED",
             message="Entities successfully linked via explicit SAME_AS edge pointer. Both original UUIDs and data lineages remain independent and unmerged.",
         )

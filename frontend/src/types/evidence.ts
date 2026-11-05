@@ -9,6 +9,7 @@ export type EvidentiaryStatus =
 
 export interface DocumentRecord {
   source_id: string;
+  event_id?: string;
   source_type: 'COURT_ORDER' | 'POLICE_FIR' | 'GAZETTE' | 'INVESTIGATIVE_REPORT';
   document_reference: string;
   issuing_authority: string;

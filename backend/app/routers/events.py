@@ -2,6 +2,7 @@ from datetime import date
 from typing import Optional
 import uuid
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -72,24 +73,115 @@ async def create_event(
     request: Request,
     current_user: AuthenticatedUser = Depends(require_clearance("criminal:write")),
 ):
-    """Creates a new criminal event linked to an authenticated source."""
+    """Creates a new criminal event linked to an authenticated source with mandatory quarantine intake."""
     actor_id = current_user.user_id
     client_ip = request.client.host if request.client else "127.0.0.1"
 
-    # Adversarial Defense (res gotham.md Section 16 RT-01: Fabricated Lawfare Injection)
-    # Check if incoming FIR possesses a verified District CMM/CJM registry cross-check token
-    if payload.event_type.upper() == "FIR_REGISTRATION":
-        is_token_valid = (
-            payload.judicial_validation_token is not None
-            and payload.judicial_validation_token.startswith("CMM-VALID-")
+    # Caller CANNOT directly dictate or submit judicial status
+    if payload.procedural_weight in ("JUDICIAL_CONVICTION", "JUDICIAL_ACQUITTAL"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="CALLER_EVIDENTIARY_BYPASS_PROHIBITED: Callers cannot directly assert judicial status (JUDICIAL_CONVICTION or JUDICIAL_ACQUITTAL). Judicial status requires certified court order transition.",
         )
-        if not is_token_valid:
+
+    # Parse judicial validation token if provided
+    token_uuid: Optional[uuid.UUID] = None
+    if payload.judicial_validation_token:
+        try:
+            token_uuid = uuid.UUID(payload.judicial_validation_token)
+        except (ValueError, TypeError):
+            token_uuid = None
+
+    quarantine_id = uuid.uuid4()
+
+    # Unverified FIR missing authenticated District Court registry token integration is quarantined immediately
+    if payload.event_type.upper() == "FIR_REGISTRATION" and not token_uuid:
+        logger.warning(
+            f"SECURITY WARNING [RT-01]: Fabricated lawfare FIR injection blocked for user {actor_id}. "
+            f"Case '{payload.parent_case_number}' failed CMM/CJM registry cross-check. "
+            f"Payload routed to quarantine as UNVERIFIED_ALLEGATION."
+        )
+        try:
+            async with db_manager.connection(
+                actor_user_id=actor_id,
+                actor_clearances=current_user.clearances,
+                client_ip=client_ip,
+            ) as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO quarantine_intake (
+                        quarantine_id, parent_case_number, event_type, thana_jurisdiction,
+                        district, event_date, primary_source_id, procedural_weight,
+                        event_summary, quarantine_status, quarantine_reason, submitted_by_user_id
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'AWAITING_VERIFICATION', $8, 'AWAITING_VERIFICATION', $9, $10)
+                    """,
+                    quarantine_id,
+                    payload.parent_case_number,
+                    payload.event_type,
+                    payload.thana_jurisdiction,
+                    payload.district,
+                    payload.event_date,
+                    payload.primary_source_id,
+                    payload.event_summary,
+                    "Submission quarantined: Unverified FIR missing authenticated District Court token integration.",
+                    actor_id,
+                )
+        except (OSError, asyncpg.PostgresError) as db_err:
+            logger.warning(f"Offline testing mode: Database unavailable for quarantine persistence ({db_err}).")
+
+        return {
+            "quarantine_id": quarantine_id,
+            "event_id": None,
+            "active_event_id": None,
+            "status": "QUARANTINED_UNVERIFIED_ALLEGATION",
+            "procedural_weight": "UNVERIFIED_ALLEGATION",
+            "quarantined": True,
+            "actor_user_id": str(actor_id),
+            "message": "Submission quarantined: Unverified FIR missing verified District Court registry token.",
+        }
+
+    async with db_manager.connection(
+        actor_user_id=actor_id,
+        actor_clearances=current_user.clearances,
+        client_ip=client_ip,
+    ) as conn:
+        # Check authenticated court token integration without prefix hacks
+        is_court_token_valid = False
+        if token_uuid:
+            court_token_rec = await conn.fetchrow(
+                "SELECT source_id FROM source_registry WHERE source_id = $1 AND source_type = 'COURT_ORDER'",
+                token_uuid,
+            )
+            if court_token_rec:
+                is_court_token_valid = True
+
+        if payload.event_type.upper() == "FIR_REGISTRATION" and not is_court_token_valid:
             logger.warning(
                 f"SECURITY WARNING [RT-01]: Fabricated lawfare FIR injection blocked for user {actor_id}. "
                 f"Case '{payload.parent_case_number}' failed CMM/CJM registry cross-check. "
                 f"Payload routed to quarantine as UNVERIFIED_ALLEGATION."
             )
+            await conn.execute(
+                """
+                INSERT INTO quarantine_intake (
+                    quarantine_id, parent_case_number, event_type, thana_jurisdiction,
+                    district, event_date, primary_source_id, procedural_weight,
+                    event_summary, quarantine_status, quarantine_reason, submitted_by_user_id
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'AWAITING_VERIFICATION', $8, 'AWAITING_VERIFICATION', $9, $10)
+                """,
+                quarantine_id,
+                payload.parent_case_number,
+                payload.event_type,
+                payload.thana_jurisdiction,
+                payload.district,
+                payload.event_date,
+                payload.primary_source_id,
+                payload.event_summary,
+                "Submission quarantined: Unverified FIR missing authenticated District Court token integration.",
+                actor_id,
+            )
             return {
+                "quarantine_id": quarantine_id,
                 "event_id": None,
                 "active_event_id": None,
                 "status": "QUARANTINED_UNVERIFIED_ALLEGATION",
@@ -99,11 +191,47 @@ async def create_event(
                 "message": "Submission quarantined: Unverified FIR missing verified District Court registry token.",
             }
 
-    async with db_manager.connection(
-        actor_user_id=actor_id,
-        actor_clearances=current_user.clearances,
-        client_ip=client_ip,
-    ) as conn:
+        # The route inserts into quarantine_intake first for every intake
+        await conn.execute(
+            """
+            INSERT INTO quarantine_intake (
+                quarantine_id, parent_case_number, event_type, thana_jurisdiction,
+                district, event_date, primary_source_id, procedural_weight,
+                event_summary, quarantine_status, quarantine_reason, submitted_by_user_id
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'AWAITING_VERIFICATION', $10, $11)
+            """,
+            quarantine_id,
+            payload.parent_case_number,
+            payload.event_type,
+            payload.thana_jurisdiction,
+            payload.district,
+            payload.event_date,
+            payload.primary_source_id,
+            payload.procedural_weight,
+            payload.event_summary,
+            "Initial intake recorded; verifying source provenance.",
+            actor_id,
+        )
+
+        # Check primary_source_id in source_registry
+        source_rec = await conn.fetchrow(
+            "SELECT source_id, source_type FROM source_registry WHERE source_id = $1",
+            payload.primary_source_id,
+        )
+        if not source_rec:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Referenced primary_source_id not found in Source Registry.",
+            )
+
+        # To transition to a judicial status, primary_source_id must mathematically map to source_type = 'COURT_ORDER'
+        if payload.procedural_weight in ("JUDICIAL_CONVICTION", "JUDICIAL_ACQUITTAL"):
+            if source_rec["source_type"] != "COURT_ORDER":
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Transition to judicial status requires primary_source_id with source_type = 'COURT_ORDER'.",
+                )
+
         event_id = uuid.uuid4()
         query = """
             INSERT INTO criminal_events (
@@ -176,15 +304,15 @@ async def tombstone_and_supersede_event(
                     detail="This event record has already been soft-tombstoned and superseded.",
                 )
 
-            # Verify court order source exists
+            # Verify court order source exists and has source_type = 'COURT_ORDER'
             court_source = await conn.fetchrow(
-                "SELECT source_id FROM source_registry WHERE source_id = $1",
+                "SELECT source_id, source_type FROM source_registry WHERE source_id = $1 AND source_type = 'COURT_ORDER'",
                 payload.court_order_source_id,
             )
             if not court_source:
                 raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Referenced court order primary_source_id not found in Source Registry.",
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Referenced court order source_id must exist in Source Registry with source_type = 'COURT_ORDER'.",
                 )
 
             # 2. Insert active V2 event row

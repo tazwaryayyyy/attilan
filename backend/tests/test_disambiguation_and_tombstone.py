@@ -18,12 +18,14 @@ class TestBengaliDisambiguationEvaluator:
 
     def test_honorific_and_unicode_normalization(self):
         norm1 = BengaliPhoneticEngine.normalize_text("Md.   Rafiqul Islam\u200c")
-        norm2 = BengaliPhoneticEngine.normalize_text("mohammad rafiqul islam")
-        norm_bn = BengaliPhoneticEngine.normalize_text("মোঃ রফিকুল ইসলাম\u200d")
+        norm2 = BengaliPhoneticEngine.normalize_text("md rafiqul islam")
+        norm_bn = BengaliPhoneticEngine.normalize_text("মাহমুদ রফিকুল ইসলাম\u200d")
 
-        assert "mohammad" in norm1
+        assert "md rafiqul islam" == norm1
         assert norm1 == norm2
-        assert "মোহাম্মদ" in norm_bn
+        # P0-04: Mahmud must never collapse to Mohammad
+        assert "মোহাম্মদ" not in norm_bn
+        assert "মাহমুদ" in norm_bn
 
     def test_high_similarity_flags_human_adjudication(self):
         candidate = BengaliDisambiguationEvaluator.evaluate_pair(
