@@ -148,7 +148,7 @@ services:
     expose: ["8080"]
 
   nginx_gateway:
-    image: nginx:1.27.4-alpine3.20
+    image: nginx:1.29.4-alpine3.23
     container_name: attilan_nginx_gateway
     restart: unless-stopped
     network_mode: bridge

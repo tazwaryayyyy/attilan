@@ -53,7 +53,7 @@ export default function App() {
       <div className="boundary-watermark boundary-watermark-b" aria-hidden="true">{BOUNDARY_WATERMARK}</div>
 
       <header className="masthead">
-        <p>ATTILAN / KHULNA / CONTROLLED INTELLIGENCE LEDGER</p>
+        <p>ATTILAN / CONTROLLED INTELLIGENCE LEDGER</p>
         <p>TERMINAL 01 · RAW DIGEST VERIFICATION ONLY</p>
       </header>
 
