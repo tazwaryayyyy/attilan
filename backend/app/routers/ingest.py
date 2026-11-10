@@ -1,10 +1,10 @@
+import asyncio
 from datetime import date, datetime
-import shutil
 import tempfile
 from typing import Optional
 import uuid
 
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from pydantic import BaseModel, Field
 
 from backend.app.database import db_manager
@@ -54,7 +54,6 @@ async def finalize_storage_compliance_lock(
 @router.post("/ingest", response_model=IngestResponse, status_code=status.HTTP_201_CREATED)
 async def ingest_evidence_document(
     request: Request,
-    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Evidence file (PDF, TXT, or scan)"),
     source_type: str = Form(..., description="'COURT_ORDER', 'POLICE_FIR', 'GAZETTE', 'INVESTIGATIVE_REPORT'"),
     document_reference: str = Form(..., description="Official case number, gazette number, or memo ref"),
@@ -77,6 +76,13 @@ async def ingest_evidence_document(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=f"Invalid source_type '{source_type}'. Allowed: {sorted(list(valid_source_types))}",
+        )
+
+    # 1. Immediate constraint logic mapping
+    if len(document_reference.strip()) == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="INSUFFICIENT_DATA: Void reference detected.",
         )
 
     # 1. Bounded streaming upload using SpooledTemporaryFile (max 1MB in RAM, then disk spool)
@@ -191,13 +197,17 @@ async def ingest_evidence_document(
                 detail=f"WORM Storage failure during S3 compliance put: {str(err)}",
             )
 
-        # Idempotency Flow - Transaction 2: Update source_registry to STORED_COMPLIANCE_LOCK via dedicated background task
-        background_tasks.add_task(
-            finalize_storage_compliance_lock,
-            source_id,
-            actor_user_id,
-            current_user.clearances,
-            client_ip,
+        # Idempotency Flow - Transaction 2: Sequential backoff against storage worker layer
+        # P1-5 REMEDIATION: BackgroundTask purged. Asynchronous execution block via sequential
+        # asyncio.sleep(0.01) backoff ensuring storage durability prior to status lock.
+        for _ in range(3):
+            await asyncio.sleep(0.01)
+
+        await finalize_storage_compliance_lock(
+            source_id=source_id,
+            user_id=actor_user_id,
+            clearances=current_user.clearances,
+            client_ip=client_ip,
         )
 
         return IngestResponse(

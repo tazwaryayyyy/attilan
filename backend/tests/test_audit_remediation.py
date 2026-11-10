@@ -300,3 +300,105 @@ class TestMission6HealthAndSensitiveExportAudit:
                 source_id,
                 "json",
             )
+
+    @patch("backend.app.routers.export.db_manager")
+    async def test_sensitive_export_fails_closed_412_on_audit_error(self, mock_db_manager):
+        """P1-6: Verifies fail-open prevention: export raises HTTP 412 if audit log insert fails."""
+        source_id = uuid.uuid4()
+        now = datetime.now()
+
+        mock_conn = AsyncMock()
+        mock_conn.fetchrow.side_effect = [
+            {
+                "source_id": source_id,
+                "source_type": "COURT_ORDER",
+                "document_reference": "Sessions Case No. 12/2026",
+                "issuing_authority": "Sessions Court Khulna",
+                "publication_date": date(2026, 4, 15),
+                "ingestion_timestamp": now,
+                "storage_uri": "s3://bucket/order.pdf",
+                "sha256_hash": "a" * 64,
+                "blake3_hash": "b" * 64,
+                "uploaded_by_user_id": uuid.uuid4(),
+            },
+            None,
+        ]
+        # Simulate audit ledger execution failure
+        mock_conn.execute.side_effect = RuntimeError("Ledger lock contention or write failure")
+
+        @asynccontextmanager
+        async def mock_conn_ctx(**kwargs):
+            yield mock_conn
+
+        mock_db_manager.connection = mock_conn_ctx
+
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                f"/export/certificate/{source_id}",
+                headers=auth_headers(uuid.uuid4(), ["evidence:export"]),
+            )
+            assert resp.status_code == 412
+            assert "Mandatory audit trail insertion failed" in resp.json()["detail"]
+
+
+class TestMission7P0P1AuditRemediations:
+    """Verifies November audit remediations: P0-3, P1-3, P1-5."""
+
+    @pytest.mark.asyncio
+    async def test_search_rejects_empty_whitespace_query_400(self):
+        """P0-3: Entity requests failing constraint length(trim(input_str)) == 0 abort with HTTP 400."""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = auth_headers(uuid.uuid4(), ["entity:read"])
+            resp = await client.get("/entity/search?q=%20%20%20", headers=headers)
+            assert resp.status_code == 400
+            assert "non-whitespace" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_disambiguation_rejects_empty_whitespace_bn_query_400(self):
+        """P0-3: Disambiguation evaluation rejects empty primary_name_bn with HTTP 400."""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            headers = auth_headers(uuid.uuid4(), ["entity:read"])
+            payload = {
+                "primary_name_bn": "    ",
+                "primary_name_en": "Test",
+            }
+            resp = await client.post("/entity/evaluate_disambiguation", json=payload, headers=headers)
+            assert resp.status_code == 400
+            assert "primary_name_bn" in resp.json()["detail"]
+
+    def test_calculate_batch_integrity_catastrophic_abort_on_gap(self):
+        """P1-3: Catastrophic abort if local index vs predecessor block sequence gap discovered."""
+        broadcaster = SequentialHashChainBroadcaster(
+            database_url="postgresql://fake@localhost/fake",
+            signing_key="audit-key-test",
+        )
+        batch = [
+            {
+                "leaf_index": 1,
+                "current_leaf_hash": "a" * 64,
+                "data_payload_hash": "d" * 64,
+            },
+            {
+                "leaf_index": 3,  # Gap: expected 2, got 3
+                "current_leaf_hash": "b" * 64,
+                "data_payload_hash": "e" * 64,
+            },
+        ]
+        with pytest.raises(RuntimeError) as exc_info:
+            broadcaster.calculate_batch_integrity(batch)
+        assert "CATASTROPHIC ABORT" in str(exc_info.value)
+        assert "sequence gap discovered" in str(exc_info.value)
+
+    def test_calculate_batch_integrity_enforces_batch_limit(self):
+        """P1-3: Enforces 50 max chunk block limit."""
+        broadcaster = SequentialHashChainBroadcaster(
+            database_url="postgresql://fake@localhost/fake",
+            signing_key="audit-key-test",
+        )
+        oversized_batch = [{"leaf_index": i, "current_leaf_hash": "a" * 64} for i in range(1, 52)]
+        with pytest.raises(ValueError) as exc_info:
+            broadcaster.calculate_batch_integrity(oversized_batch)
+        assert "50 hardware limit" in str(exc_info.value)

@@ -23,7 +23,7 @@ class EventCreateRequest(BaseModel):
     parent_case_number: str = Field(..., description="e.g. 'Khulna Sadar PS Case No. 12(05)2025'")
     event_type: str = Field(..., description="'FIR_REGISTRATION', 'BAIL_ORDER', 'CHARGE_SHEET', 'JUDICIAL_VERDICT'")
     thana_jurisdiction: str = Field(..., description="e.g. 'Labanchora KMP'")
-    district: str = Field(default="Khulna")
+    district: str = Field(default="ZONE_ALPHA_7")
     event_date: date
     primary_source_id: uuid.UUID
     procedural_weight: str = Field(
@@ -344,20 +344,28 @@ async def tombstone_and_supersede_event(
                 payload.new_event_summary,
             )
 
-            # 3. Soft-tombstone V1 record
-            update_v1_sql = """
-                UPDATE criminal_events
-                SET is_superseded = TRUE,
-                    superseded_by_event_id = $1,
-                    legal_justification = $2
-                WHERE event_id = $3;
-            """
-            await conn.execute(
-                update_v1_sql,
-                v2_event_id,
-                payload.legal_justification,
-                event_id,
-            )
+            # 3. Soft-tombstone V1 record via atomic supersede_criminal_event function
+            try:
+                await conn.execute(
+                    "SELECT supersede_criminal_event($1, $2, $3)",
+                    event_id,
+                    v2_event_id,
+                    payload.legal_justification,
+                )
+            except Exception:
+                update_v1_sql = """
+                    UPDATE criminal_events
+                    SET is_superseded = TRUE,
+                        superseded_by_event_id = $1,
+                        legal_justification = $2
+                    WHERE event_id = $3;
+                """
+                await conn.execute(
+                    update_v1_sql,
+                    v2_event_id,
+                    payload.legal_justification,
+                    event_id,
+                )
 
             return TombstoneResponse(
                 superseded_v1_event_id=event_id,

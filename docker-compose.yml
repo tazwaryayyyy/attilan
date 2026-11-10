@@ -59,11 +59,14 @@ services:
       MINIO_EVIDENCE_BUCKET: ${MINIO_EVIDENCE_BUCKET:?set MINIO_EVIDENCE_BUCKET in .env}
     entrypoint: >
       /bin/sh -c "
-        aws --endpoint-url=http://localstack:4566 s3api create-bucket --bucket $$MINIO_EVIDENCE_BUCKET || true;
+        set -e;
+        aws --endpoint-url=http://localstack:4566 s3api create-bucket --bucket $$MINIO_EVIDENCE_BUCKET;
         aws --endpoint-url=http://localstack:4566 s3api put-object-lock-configuration
           --bucket $$MINIO_EVIDENCE_BUCKET
-          --object-lock-configuration '{\"ObjectLockEnabled\":\"Enabled\"}' || true;
-        exit 0;
+          --object-lock-configuration '{\"ObjectLockEnabled\":\"Enabled\"}';
+        aws --endpoint-url=http://localstack:4566 s3api get-object-lock-configuration
+          --bucket $$MINIO_EVIDENCE_BUCKET;
+        echo 'WORM Object Lock successfully enforced on bucket $$MINIO_EVIDENCE_BUCKET';
       "
 
   backend:

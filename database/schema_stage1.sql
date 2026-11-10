@@ -133,10 +133,12 @@ CREATE TABLE IF NOT EXISTS source_registry (
     uploaded_by_user_id UUID NOT NULL,
     source_signature BYTEA, -- Cryptographic provider signature if available
     upload_status VARCHAR(64) NOT NULL DEFAULT 'UPLOAD_PENDING',
+    source_verification_status VARCHAR(64) NOT NULL DEFAULT 'UNVERIFIED_SOURCE',
     CONSTRAINT unq_source_hash UNIQUE(sha256_hash)
 );
 
 ALTER TABLE source_registry ADD COLUMN IF NOT EXISTS upload_status VARCHAR(64) NOT NULL DEFAULT 'UPLOAD_PENDING';
+ALTER TABLE source_registry ADD COLUMN IF NOT EXISTS source_verification_status VARCHAR(64) NOT NULL DEFAULT 'UNVERIFIED_SOURCE';
 
 -- 2.1b Quarantine Intake (Unverified Submissions & Lacking Court Validation)
 CREATE TABLE IF NOT EXISTS quarantine_intake (
@@ -144,9 +146,10 @@ CREATE TABLE IF NOT EXISTS quarantine_intake (
     parent_case_number VARCHAR(128),
     event_type VARCHAR(64) NOT NULL,
     thana_jurisdiction VARCHAR(128) NOT NULL,
-    district VARCHAR(64) NOT NULL DEFAULT 'Khulna',
+    district VARCHAR(64) NOT NULL DEFAULT 'ZONE_ALPHA_7',
     event_date DATE NOT NULL,
-    primary_source_id UUID NOT NULL REFERENCES source_registry(source_id),
+    primary_source_reference UUID NULL, -- DECOUPLED UNTIL WORM SYNC
+    primary_source_id UUID NULL REFERENCES source_registry(source_id),
     procedural_weight VARCHAR(64) NOT NULL DEFAULT 'AWAITING_VERIFICATION',
     event_summary TEXT NOT NULL,
     quarantine_status VARCHAR(64) NOT NULL DEFAULT 'AWAITING_VERIFICATION',
@@ -155,13 +158,16 @@ CREATE TABLE IF NOT EXISTS quarantine_intake (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE quarantine_intake ADD COLUMN IF NOT EXISTS primary_source_reference UUID REFERENCES source_registry(source_id);
+ALTER TABLE quarantine_intake ADD COLUMN IF NOT EXISTS primary_source_id UUID REFERENCES source_registry(source_id);
+
 -- 2.2 Documented Events (FIRs, GDs, Bail Hearings, Charge Sheets)
 CREATE TABLE IF NOT EXISTS criminal_events (
     event_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
     parent_case_number VARCHAR(128), -- e.g., 'Khulna Sadar PS Case No. 12(05)2025'
     event_type VARCHAR(64) NOT NULL, -- 'FIR_REGISTRATION', 'BAIL_ORDER', 'CHARGE_SHEET'
     thana_jurisdiction VARCHAR(128) NOT NULL, -- e.g., 'Labanchora KMP', 'Rupsha District'
-    district VARCHAR(64) NOT NULL DEFAULT 'Khulna',
+    district VARCHAR(64) NOT NULL DEFAULT 'ZONE_ALPHA_7',
     event_date DATE NOT NULL,
     location_geom GEOMETRY(Point, 4326),
     primary_source_id UUID NOT NULL REFERENCES source_registry(source_id),
@@ -325,10 +331,43 @@ BEGIN
             'new', to_jsonb(NEW)
         );
 
-        IF v_target_table = 'source_registry' THEN v_target_uuid := NEW.source_id;
-        ELSIF v_target_table = 'quarantine_intake' THEN v_target_uuid := NEW.quarantine_id;
+        IF v_target_table = 'source_registry' THEN 
+            v_target_uuid := NEW.source_id;
+            IF OLD.source_id != NEW.source_id OR
+               OLD.source_type != NEW.source_type OR
+               OLD.document_reference != NEW.document_reference OR
+               OLD.issuing_authority != NEW.issuing_authority OR
+               OLD.publication_date != NEW.publication_date OR
+               OLD.ingestion_timestamp != NEW.ingestion_timestamp OR
+               OLD.storage_uri != NEW.storage_uri OR
+               OLD.sha256_hash != NEW.sha256_hash OR
+               OLD.blake3_hash != NEW.blake3_hash OR
+               OLD.uploaded_by_user_id != NEW.uploaded_by_user_id THEN
+                RAISE EXCEPTION 'IMMUTABILITY VIOLATION: Direct modification of source_registry core evidence metadata is prohibited.';
+            END IF;
+        ELSIF v_target_table = 'quarantine_intake' THEN 
+            v_target_uuid := NEW.quarantine_id;
+            IF OLD.quarantine_id != NEW.quarantine_id OR
+               OLD.submitted_by_user_id != NEW.submitted_by_user_id OR
+               OLD.created_at != NEW.created_at THEN
+                RAISE EXCEPTION 'IMMUTABILITY VIOLATION: Core identity fields in quarantine_intake cannot be mutated.';
+            END IF;
         ELSIF v_target_table = 'criminal_events' THEN 
             v_target_uuid := NEW.event_id;
+            IF OLD.event_id != NEW.event_id OR
+               OLD.parent_case_number IS DISTINCT FROM NEW.parent_case_number OR
+               OLD.event_type != NEW.event_type OR
+               OLD.thana_jurisdiction != NEW.thana_jurisdiction OR
+               OLD.district != NEW.district OR
+               OLD.event_date != NEW.event_date OR
+               OLD.primary_source_id != NEW.primary_source_id OR
+               OLD.procedural_weight != NEW.procedural_weight OR
+               OLD.event_summary != NEW.event_summary THEN
+                RAISE EXCEPTION 'IMMUTABILITY VIOLATION: Core evidentiary fields in criminal_events cannot be modified during soft-tombstone.';
+            END IF;
+            IF OLD.is_superseded = TRUE THEN
+                RAISE EXCEPTION 'PERMISSION DENIED: Event % is already superseded and cannot be mutated again.', OLD.event_id;
+            END IF;
             IF NOT (NEW.is_superseded = TRUE AND NEW.legal_justification IS NOT NULL) THEN
                 RAISE EXCEPTION 'PERMISSION DENIED: Direct UPDATE on criminal_events is prohibited. Soft-tombstone required (is_superseded=TRUE with valid legal_justification).';
             END IF;
@@ -427,6 +466,20 @@ CREATE TRIGGER trg_hash_chain_quarantine_intake
     AFTER INSERT OR UPDATE ON quarantine_intake
     FOR EACH ROW EXECUTE FUNCTION process_sequential_hash_chain_event();
 
+-- P0-2: Log quarantine insertion failures / persistence confirmation immediately
+CREATE OR REPLACE FUNCTION log_quarantine_persistence_confirmation()
+RETURNS TRIGGER AS $$
+BEGIN
+    RAISE LOG 'QUARANTINE_PERSISTENCE_CONFIRMED: quarantine_id=%, submitted_by=%', NEW.quarantine_id, NEW.submitted_by_user_id;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, app;
+
+DROP TRIGGER IF EXISTS trg_quarantine_persist_confirm ON quarantine_intake;
+CREATE TRIGGER trg_quarantine_persist_confirm
+    AFTER INSERT ON quarantine_intake
+    FOR EACH ROW EXECUTE FUNCTION log_quarantine_persistence_confirmation();
+
 CREATE OR REPLACE FUNCTION log_sensitive_export_audit(
     p_target_table VARCHAR(64),
     p_target_uuid UUID,
@@ -507,6 +560,50 @@ BEGIN
         v_payload_hash,
         v_current_leaf_hash
     );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, app;
+
+--------------------------------------------------------------------------------
+-- 3b. Dedicated Atomic Incrementor Function for Append-Only Superseding (P1-2)
+--------------------------------------------------------------------------------
+
+CREATE OR REPLACE FUNCTION supersede_criminal_event(
+    p_event_id UUID,
+    p_superseded_by_id UUID,
+    p_legal_justification TEXT,
+    p_previous_payload JSONB DEFAULT NULL,
+    p_previous_hash CHAR(64) DEFAULT NULL
+) RETURNS VOID AS $$
+DECLARE
+    v_old_rec RECORD;
+    v_computed_hash CHAR(64);
+BEGIN
+    SELECT * INTO v_old_rec FROM criminal_events WHERE event_id = p_event_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'SUPERSEDE FAILED: Target event % not found.', p_event_id;
+    END IF;
+    IF v_old_rec.is_superseded THEN
+        RAISE EXCEPTION 'SUPERSEDE FAILED: Target event % is already superseded.', p_event_id;
+    END IF;
+
+    -- Verify previous exact hash / payload invariant if provided
+    IF p_previous_hash IS NOT NULL THEN
+        v_computed_hash := encode(digest(to_jsonb(v_old_rec)::TEXT, 'sha256'), 'hex');
+        IF v_computed_hash != p_previous_hash THEN
+            RAISE EXCEPTION 'SUPERSEDE INTEGRITY FAILED: Provided hash % does not match current state hash %.', p_previous_hash, v_computed_hash;
+        END IF;
+    ELSIF p_previous_payload IS NOT NULL THEN
+        v_computed_hash := encode(digest(to_jsonb(v_old_rec)::TEXT, 'sha256'), 'hex');
+        IF v_computed_hash != encode(digest(p_previous_payload::TEXT, 'sha256'), 'hex') THEN
+            RAISE EXCEPTION 'SUPERSEDE INTEGRITY FAILED: Provided snapshot does not match current state.';
+        END IF;
+    END IF;
+
+    UPDATE criminal_events
+    SET is_superseded = TRUE,
+        superseded_by_event_id = p_superseded_by_id,
+        legal_justification = p_legal_justification
+    WHERE event_id = p_event_id;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public, app;
 
@@ -619,14 +716,20 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA public FROM PUBLIC;
 REVOKE ALL ON TABLE audit_merkle_ledger FROM api_worker, audit_reader;
 REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE audit_merkle_ledger FROM api_worker, audit_reader;
 REVOKE DELETE, TRUNCATE ON source_registry, quarantine_intake, criminal_events, entities, event_assertions, entity_edges FROM api_worker;
+REVOKE UPDATE ON source_registry, criminal_events, quarantine_intake FROM api_worker;
 
 GRANT USAGE ON SCHEMA public, app TO api_worker, audit_reader;
-GRANT SELECT, INSERT, UPDATE ON source_registry, quarantine_intake, criminal_events, entities, event_assertions, entity_edges TO api_worker;
+GRANT SELECT, INSERT ON source_registry, quarantine_intake, criminal_events TO api_worker;
+GRANT UPDATE (upload_status) ON source_registry TO api_worker;
+GRANT UPDATE (quarantine_status, procedural_weight) ON quarantine_intake TO api_worker;
+GRANT UPDATE (is_superseded, superseded_by_event_id, legal_justification) ON criminal_events TO api_worker;
+GRANT SELECT, INSERT, UPDATE ON entities, event_assertions, entity_edges TO api_worker;
 GRANT SELECT ON audit_merkle_ledger TO api_worker, audit_reader;
 GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO api_worker;
 GRANT EXECUTE ON FUNCTION app.current_actor_id() TO api_worker;
 GRANT EXECUTE ON FUNCTION app.has_clearance(TEXT) TO api_worker;
 GRANT EXECUTE ON FUNCTION log_sensitive_export_audit(VARCHAR, UUID, VARCHAR) TO api_worker;
+GRANT EXECUTE ON FUNCTION supersede_criminal_event(UUID, UUID, TEXT, JSONB, CHAR) TO api_worker;
 
 -- FORCE RLS so ownership cannot silently bypass policies on criminal data.
 -- audit_merkle_ledger is excluded: SECURITY DEFINER hash-chain triggers must append as db_owner.
@@ -736,3 +839,5 @@ ALTER FUNCTION enforce_criminal_events_soft_tombstone() OWNER TO db_owner;
 ALTER FUNCTION enforce_source_registry_delete_block() OWNER TO db_owner;
 ALTER FUNCTION protect_audit_ledger() OWNER TO db_owner;
 ALTER FUNCTION block_table_truncate() OWNER TO db_owner;
+ALTER FUNCTION log_quarantine_persistence_confirmation() OWNER TO db_owner;
+ALTER FUNCTION supersede_criminal_event(UUID, UUID, TEXT, JSONB, CHAR) OWNER TO db_owner;

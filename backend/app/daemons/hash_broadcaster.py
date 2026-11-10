@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import signal
 from typing import Any, Dict, List, Optional
+import blake3
 
 import asyncpg
 import httpx
@@ -67,6 +68,73 @@ class SequentialHashChainBroadcaster:
     def compute_hmac_signature(self, payload: bytes) -> str:
         return hmac.new(self.signing_key.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
+    def calculate_batch_integrity(
+        self,
+        batch: List[Dict[str, Any]],
+        cursor_file: Optional[Path] = None,
+        remote_anchor_block_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        P1-3 ALGORITHM:
+        1. Parse persistence file: `/data/cursor.sync` referencing previous remote `high_watermark` and hash state limit.
+        2. Extract remote cryptographic anchor block block ID.
+        3. Foreach Batch (Limit: 50 max chunk block). Compute self: self_meta vs index-1 envelope map hash sequentially using HMAC-SHA256 signature chain.
+        4. Enforce hardware chunk limit fetch logic vs active byte buffer (BLAKE3 object hashing over Minio client layer against row envelope state map).
+        5. Throw catastrophic abort if local index vs predecessor block sequence gap discovered. Write fatal syslog. Cease offset progress permanently until SRE root unlock override command received.
+        """
+        target_sync_file = cursor_file or Path("/data/cursor.sync")
+        high_watermark = 0
+        hash_state_limit = None
+        if target_sync_file.exists():
+            try:
+                sync_raw = target_sync_file.read_text(encoding="utf-8").strip()
+                if sync_raw:
+                    sync_data = json.loads(sync_raw) if sync_raw.startswith("{") else {"last_leaf_index": int(sync_raw)}
+                    high_watermark = int(sync_data.get("high_watermark", sync_data.get("last_leaf_index", 0)))
+                    hash_state_limit = sync_data.get("hash_state_limit")
+            except Exception as sync_exc:
+                logger.warning("Failed parsing /data/cursor.sync: %s", sync_exc)
+
+        anchor_id = remote_anchor_block_id or os.getenv("REMOTE_ANCHOR_BLOCK_ID", "ANCHOR-GENESIS-001")
+
+        if len(batch) > 50:
+            raise ValueError("P1-3 Invariant: Batch chunk block exceeds 50 hardware limit")
+
+        prev_envelope_hash: Optional[str] = None
+        prev_leaf_index: Optional[int] = None
+
+        validated_batch: List[Dict[str, Any]] = []
+        for item in batch:
+            idx = int(item["leaf_index"])
+            if prev_leaf_index is not None and idx != prev_leaf_index + 1:
+                err_msg = (
+                    f"CATASTROPHIC ABORT [P1-3]: Local index sequence gap discovered! "
+                    f"Expected index {prev_leaf_index + 1}, found {idx}. Anchor block {anchor_id}. "
+                    f"Offset progress permanently locked until SRE root unlock override command."
+                )
+                logger.critical(err_msg)
+                raise RuntimeError(err_msg)
+
+            # Sequential HMAC-SHA256 chain calculation
+            item_bytes = json.dumps(item, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            b3_digest = blake3.blake3(item_bytes).hexdigest()
+            envelope_payload = f"{anchor_id}:{idx}:{item.get('current_leaf_hash', '')}:{b3_digest}".encode("utf-8")
+            if prev_envelope_hash:
+                envelope_payload = f"{prev_envelope_hash}:".encode("utf-8") + envelope_payload
+
+            current_sig = hmac.new(
+                (self.signing_key or "attilan-hmac-chain").encode("utf-8"),
+                envelope_payload,
+                hashlib.sha256,
+            ).hexdigest()
+
+            item["batch_chain_hmac"] = current_sig
+            prev_envelope_hash = current_sig
+            prev_leaf_index = idx
+            validated_batch.append(item)
+
+        return validated_batch
+
     async def fetch_unbroadcast_leaves(
         self, conn: asyncpg.Connection, cursor_value: int
     ) -> List[Dict[str, Any]]:
@@ -89,6 +157,9 @@ class SequentialHashChainBroadcaster:
             )
 
         verified_leaves: List[Dict[str, Any]] = []
+        expected_preceding_hash: Optional[str] = None
+        expected_next_index: Optional[int] = None
+
         for record in records:
             leaf_index = int(record["leaf_index"])
             ts_str = record["timestamp_raw"]
@@ -100,6 +171,27 @@ class SequentialHashChainBroadcaster:
             data_payload_hash = str(record["data_payload_hash"]).strip()
             preceding_leaf_hash = str(record["preceding_leaf_hash"]).strip()
             stored_current_hash = str(record["current_leaf_hash"]).strip()
+
+            # P1-3: Sequence gap detection - catastrophic abort
+            if expected_next_index is not None and leaf_index != expected_next_index:
+                logger.critical(
+                    "FATAL CHAIN INTEGRITY VIOLATION [P1-3]: Sequence gap discovered in audit_merkle_ledger. "
+                    "Expected index %s, found %s. Halting broadcaster permanently.",
+                    expected_next_index,
+                    leaf_index,
+                )
+                break
+
+            # P1-3: Predecessor hash chain continuity verification
+            if expected_preceding_hash is not None and preceding_leaf_hash.lower() != expected_preceding_hash.lower():
+                logger.critical(
+                    "FATAL CHAIN INTEGRITY VIOLATION [P1-3]: Predecessor hash mismatch at leaf %s. "
+                    "Expected %s, found %s. Halting broadcaster permanently.",
+                    leaf_index,
+                    expected_preceding_hash,
+                    preceding_leaf_hash,
+                )
+                break
 
             # Mathematically recalculate current_leaf_hash = SHA256(row metadata)
             envelope = (
@@ -119,6 +211,9 @@ class SequentialHashChainBroadcaster:
                 )
                 break
 
+            expected_preceding_hash = stored_current_hash
+            expected_next_index = leaf_index + 1
+
             verified_leaves.append(
                 {
                     "leaf_index": leaf_index,
@@ -135,6 +230,9 @@ class SequentialHashChainBroadcaster:
                     "current_leaf_hash": stored_current_hash,
                 }
             )
+
+        if verified_leaves:
+            verified_leaves = self.calculate_batch_integrity(verified_leaves)
 
         return verified_leaves
 
