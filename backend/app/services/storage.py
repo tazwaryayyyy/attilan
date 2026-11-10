@@ -11,6 +11,17 @@ from backend.app.config import settings
 class MinioWORMStorage:
     """Manages S3 Object Lock (WORM - Write Once, Read Many) compliance storage."""
 
+    @staticmethod
+    def _normalize_object_name(object_name: str) -> str:
+        normalized = str(object_name).replace("\\", "/").strip()
+        parts = [part for part in normalized.split("/") if part and part not in {".", ".."}]
+        if not parts:
+            raise ValueError("Object name must include at least one non-empty path segment.")
+        sanitized = "/".join(parts)
+        if sanitized.startswith("/"):
+            sanitized = sanitized.lstrip("/")
+        return sanitized
+
     def __init__(self) -> None:
         self.client = Minio(
             endpoint=settings.MINIO_ENDPOINT,
@@ -49,6 +60,7 @@ class MinioWORMStorage:
         Once locked in COMPLIANCE mode, no user (including root) can overwrite
         or delete the object until the retention period expires.
         """
+        safe_object_name = self._normalize_object_name(object_name)
         self.ensure_bucket_exists()
 
         retain_until = datetime.now(timezone.utc) + timedelta(days=365 * self.retention_years)
@@ -60,7 +72,7 @@ class MinioWORMStorage:
         data_stream.seek(0)
         self.client.put_object(
             bucket_name=self.bucket_name,
-            object_name=object_name,
+            object_name=safe_object_name,
             data=data_stream,
             length=length,
             content_type=content_type,
@@ -68,7 +80,7 @@ class MinioWORMStorage:
             retention=retention,
         )
 
-        return f"s3://{self.bucket_name}/{object_name}"
+        return f"s3://{self.bucket_name}/{safe_object_name}"
 
     def get_object(self, object_name: str) -> BinaryIO:
         """Retrieves read stream for a stored evidence object."""

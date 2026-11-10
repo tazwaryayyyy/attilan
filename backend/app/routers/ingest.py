@@ -1,6 +1,7 @@
 import asyncio
 from datetime import date, datetime
 import tempfile
+from pathlib import Path
 from typing import Optional
 import uuid
 
@@ -103,9 +104,25 @@ async def ingest_evidence_document(
 
         actor_user_id = current_user.user_id
         client_ip = request.client.host if request.client else "127.0.0.1"
-        source_sig_bytes = bytes.fromhex(source_signature) if source_signature else None
+        if source_signature:
+            try:
+                source_sig_bytes = bytes.fromhex(source_signature.replace(" ", "").replace("\t", ""))
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="source_signature must be valid hexadecimal bytes.",
+                ) from exc
+        else:
+            source_sig_bytes = None
 
-        object_key = f"evidence/{publication_date.year}/{sha256_hash}_{file.filename}"
+        filename = (file.filename or "upload.bin").strip()
+        safe_filename = Path(filename).name.replace("\\", "/").split("/")[-1]
+        if not safe_filename or safe_filename in {".", ".."}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Uploaded file name is invalid.",
+            )
+        object_key = f"evidence/{publication_date.year}/{sha256_hash}_{safe_filename}"
         target_storage_uri = f"s3://{storage_service.bucket_name}/{object_key}"
         source_id = uuid.uuid4()
         now = datetime.now()

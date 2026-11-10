@@ -26,6 +26,13 @@ async def generate_raw_digest_manifest(
     """
     client_ip = request.client.host if request.client else "127.0.0.1"
 
+    requested_format = str(format or "json").strip().lower()
+    if requested_format not in {"json", "markdown"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Unsupported export format. Use 'json' or 'markdown'.",
+        )
+
     async with db_manager.connection(
         actor_user_id=current_user.user_id,
         actor_clearances=current_user.clearances,
@@ -36,7 +43,7 @@ async def generate_raw_digest_manifest(
             """
             SELECT source_id, source_type, document_reference, issuing_authority,
                    publication_date, ingestion_timestamp, storage_uri, sha256_hash,
-                   blake3_hash, uploaded_by_user_id
+                   blake3_hash, uploaded_by_user_id, upload_status
             FROM source_registry
             WHERE source_id = $1;
             """,
@@ -49,7 +56,8 @@ async def generate_raw_digest_manifest(
                 detail=f"Source record with ID '{source_id}' was not found in source_registry.",
             )
 
-        if source_row.get("upload_status") and source_row.get("upload_status") not in ("STORED_COMPLIANCE_LOCK", "UPLOAD_PENDING"):
+        upload_status = source_row.get("upload_status")
+        if upload_status and upload_status not in ("STORED_COMPLIANCE_LOCK", "UPLOAD_PENDING"):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="DATA UNAVAILABLE: Entity void or incomplete payload durability mapping.",
@@ -99,7 +107,7 @@ async def generate_raw_digest_manifest(
             await conn.execute(
                 "SELECT log_sensitive_export_audit('source_registry', $1, $2)",
                 source_id,
-                format or "json",
+                requested_format,
             )
         except Exception as audit_err:
             raise HTTPException(
@@ -113,7 +121,7 @@ async def generate_raw_digest_manifest(
             requested_by=current_user.user_id,
         )
 
-        if format.lower() == "markdown":
+        if requested_format == "markdown":
             return PlainTextResponse(content=manifest.markdown_representation, media_type="text/markdown")
 
         return manifest

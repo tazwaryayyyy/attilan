@@ -77,4 +77,3 @@ docker compose -f docker-compose.prod.yml exec db_core \
   psql -U "$DB_BOOTSTRAP_USER" -d "$POSTGRES_DB" -c '\dp audit_merkle_ledger'
 ```
 
-EXIT STATUS: 0 indicates verified command completion. Any nonzero status halts workflow—boundary breach.

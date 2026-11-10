@@ -402,3 +402,46 @@ class TestMission7P0P1AuditRemediations:
         with pytest.raises(ValueError) as exc_info:
             broadcaster.calculate_batch_integrity(oversized_batch)
         assert "50 hardware limit" in str(exc_info.value)
+
+    @pytest.mark.asyncio
+    async def test_invalid_hex_source_signature_rejected_422(self):
+        """Verifies invalid hex source_signature raises HTTP 422."""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            files = {"file": ("test.pdf", b"Content", "application/pdf")}
+            data = {
+                "source_type": "COURT_ORDER",
+                "document_reference": "Ref-101",
+                "issuing_authority": "Auth",
+                "publication_date": "2026-05-12",
+                "source_signature": "NOT_VALID_HEX_ZZZ!!",
+            }
+            resp = await client.post(
+                "/ingest",
+                files=files,
+                data=data,
+                headers=auth_headers(uuid.uuid4(), ["evidence:ingest"]),
+            )
+            assert resp.status_code == 422
+            assert "hexadecimal bytes" in resp.json()["detail"]
+
+    @pytest.mark.asyncio
+    async def test_unsupported_export_format_rejected_422(self):
+        """Verifies unsupported export format raises HTTP 422."""
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                f"/export/certificate/{uuid.uuid4()}?format=xml",
+                headers=auth_headers(uuid.uuid4(), ["evidence:export"]),
+            )
+            assert resp.status_code == 422
+            assert "Unsupported export format" in resp.json()["detail"]
+
+    def test_storage_object_name_normalization(self):
+        """Verifies S3 object key traversal prevention in MinioWORMStorage."""
+        from backend.app.services.storage import MinioWORMStorage
+        assert MinioWORMStorage._normalize_object_name("evidence/2026/test.pdf") == "evidence/2026/test.pdf"
+        assert MinioWORMStorage._normalize_object_name("evidence\\2026\\test.pdf") == "evidence/2026/test.pdf"
+        assert MinioWORMStorage._normalize_object_name("/evidence/../2026/./test.pdf") == "evidence/2026/test.pdf"
+        with pytest.raises(ValueError):
+            MinioWORMStorage._normalize_object_name("/../..")
