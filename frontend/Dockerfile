@@ -9,7 +9,7 @@ RUN npm run build
 
 # Pinned nginx-alpine runtime executed as the dedicated UID, on an unprivileged
 # port. The config contains no development server or Vite fallback.
-FROM nginx:1.29.4-alpine3.23 AS runtime
+FROM nginx:1.27-alpine AS runtime
 
 RUN addgroup -S -g 10001 attilan \
     && adduser -S -D -H -u 10001 -G attilan attilan \
@@ -21,7 +21,7 @@ RUN addgroup -S -g 10001 attilan \
         /usr/share/nginx/html \
         /etc/nginx/conf.d \
     # Rewrite the global nginx.conf so the pid file lands in a writable location
-    && sed -i 's|/run/nginx.pid|/tmp/nginx/nginx.pid|g' /etc/nginx/nginx.conf
+    && sed -i 's|/run/nginx.pid|/tmp/nginx.pid|g' /etc/nginx/nginx.conf
 
 COPY nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=builder --chown=10001:10001 /app/dist /usr/share/nginx/html

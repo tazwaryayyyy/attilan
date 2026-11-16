@@ -3,7 +3,11 @@ services:
     image: postgis/postgis:17-3.5-alpine
     container_name: attilan_db_core
     restart: unless-stopped
-    network_mode: bridge
+    networks:
+      attilan_net:
+        aliases:
+          - db_core
+          - db-core
     environment:
       POSTGRES_USER: ${DB_BOOTSTRAP_USER:?set DB_BOOTSTRAP_USER in .env}
       POSTGRES_PASSWORD: ${DB_BOOTSTRAP_PASSWORD:?set DB_BOOTSTRAP_PASSWORD in .env}
@@ -21,47 +25,44 @@ services:
       start_period: 5s
 
   minio_worm:
-    image: minio/minio:RELEASE.2024-10-13T13-34-11Z
+    # Self-provisioning: entrypoint wrapper starts server, configures local
+    # WORM bucket + API user via built-in mc, then hands off to server.
+    image: cgr.dev/chainguard/minio:latest
     container_name: attilan_minio_worm
     restart: unless-stopped
-    network_mode: bridge
-    command: server /data
-    environment:
-      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
-      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
-    volumes:
-      - minio_data:/data
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:9000/minio/health/live"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 5s
-
-  minio_setup:
-    image: minio/mc:RELEASE.2024-10-13T13-34-11Z
-    container_name: attilan_minio_setup
-    restart: "no"
-    network_mode: bridge
-    links:
-      - minio_worm:minio_worm
-    depends_on:
-      minio_worm:
-        condition: service_healthy
+    networks:
+      attilan_net:
+        aliases:
+          - minio-worm
+          - minio_worm
+    entrypoint: ["/usr/bin/sh", "/minio-entrypoint.sh"]
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
       MINIO_EVIDENCE_BUCKET: ${MINIO_EVIDENCE_BUCKET:?set MINIO_EVIDENCE_BUCKET in .env}
       MINIO_API_USER: ${MINIO_API_USER:-attilan_api}
       MINIO_API_PASSWORD: ${MINIO_API_PASSWORD:?set MINIO_API_PASSWORD in .env}
-    entrypoint: >
-      /bin/sh -ec "
-      until /usr/bin/mc alias set attilan http://minio_worm:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD; do sleep 2; done;
-      /usr/bin/mc mb --with-lock attilan/$$MINIO_EVIDENCE_BUCKET || true;
-      /usr/bin/mc retention set --default COMPLIANCE 3650d attilan/$$MINIO_EVIDENCE_BUCKET || true;
-      /usr/bin/mc admin user add attilan $$MINIO_API_USER $$MINIO_API_PASSWORD || true;
-      /usr/bin/mc admin policy attach attilan readwrite --user $$MINIO_API_USER || true;
-      "
+    volumes:
+      - minio_data:/data
+      - ./minio/minio-entrypoint.sh:/minio-entrypoint.sh:ro
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 15s
+
+  minio_setup:
+    # Thin sentinel: waits for minio_worm to become healthy, then exits 0.
+    image: cgr.dev/chainguard/minio:latest
+    container_name: attilan_minio_setup
+    restart: "no"
+    networks:
+      - attilan_net
+    depends_on:
+      minio_worm:
+        condition: service_healthy
+    entrypoint: ["/usr/bin/sh", "-c", "echo 'MinIO WORM ready and provisioned.'; exit 0"]
 
   fastapi_engine:
     build:
@@ -69,16 +70,17 @@ services:
       dockerfile: backend/Dockerfile
     container_name: attilan_fastapi_engine
     restart: unless-stopped
-    network_mode: bridge
+    networks:
+      attilan_net:
+        aliases:
+          - fastapi_engine
+          - fastapi-engine
     user: "10001:10001"
     read_only: true
     tmpfs:
       - /tmp:uid=10001,gid=10001,mode=0700
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
-    links:
-      - db_core:db_core
-      - minio_worm:minio_worm
     depends_on:
       db_core:
         condition: service_healthy
@@ -87,7 +89,7 @@ services:
     environment:
       ENVIRONMENT: production
       DATABASE_URL: postgresql://api_worker_login:${API_WORKER_PASSWORD:?set API_WORKER_PASSWORD in .env}@db_core:5432/${POSTGRES_DB:?set POSTGRES_DB in .env}
-      MINIO_ENDPOINT: minio_worm:9000
+      MINIO_ENDPOINT: minio-worm:9000
       MINIO_ACCESS_KEY: ${MINIO_API_USER:-attilan_api}
       MINIO_SECRET_KEY: ${MINIO_API_PASSWORD:?set MINIO_API_PASSWORD in .env}
       MINIO_SECURE: "false"
@@ -111,15 +113,14 @@ services:
     container_name: attilan_hash_broadcaster
     restart: unless-stopped
     command: ["python", "-m", "backend.app.daemons.hash_broadcaster"]
-    network_mode: bridge
+    networks:
+      - attilan_net
     user: "10001:10001"
     read_only: true
     tmpfs:
       - /tmp:uid=10001,gid=10001,mode=0700
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
-    links:
-      - db_core:db_core
     depends_on:
       db_core:
         condition: service_healthy
@@ -138,23 +139,27 @@ services:
       dockerfile: Dockerfile
     container_name: attilan_frontend_ui
     restart: unless-stopped
-    network_mode: bridge
+    networks:
+      attilan_net:
+        aliases:
+          - frontend_ui
+          - frontend-ui
     user: "10001:10001"
     read_only: true
     tmpfs:
       - /tmp:uid=10001,gid=10001,mode=0700
+      - /var/cache/nginx:uid=10001,gid=10001,mode=0700
+      - /var/run:uid=10001,gid=10001,mode=0700
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
     expose: ["8080"]
 
   nginx_gateway:
-    image: nginx:1.29.4-alpine3.23
+    image: nginx:1.27-alpine
     container_name: attilan_nginx_gateway
     restart: unless-stopped
-    network_mode: bridge
-    links:
-      - fastapi_engine:fastapi_engine
-      - frontend_ui:frontend_ui
+    networks:
+      - attilan_net
     depends_on:
       - fastapi_engine
       - frontend_ui
@@ -164,6 +169,10 @@ services:
     volumes:
       - ./nginx/nginx.prod.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/certs:/etc/nginx/certs:ro
+
+networks:
+  attilan_net:
+    driver: bridge
 
 volumes:
   postgres_data:

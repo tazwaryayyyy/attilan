@@ -77,3 +77,5 @@ docker compose -f docker-compose.prod.yml exec db_core \
   psql -U "$DB_BOOTSTRAP_USER" -d "$POSTGRES_DB" -c '\dp audit_merkle_ledger'
 ```
 
+
+yt:https://youtu.be/F103dT0Bp0s?si=Id7-1xhY6ZMM5Tbw
