@@ -9,7 +9,7 @@ services:
         aliases:
           - postgres
           - db
-    entrypoint: ["/bin/sh", "/postgres-entrypoint.sh"]
+    entrypoint: [ "/bin/sh", "/postgres-entrypoint.sh" ]
     environment:
       POSTGRES_USER: ${DB_BOOTSTRAP_USER:?set DB_BOOTSTRAP_USER in .env}
       POSTGRES_PASSWORD: ${DB_BOOTSTRAP_PASSWORD:?set DB_BOOTSTRAP_PASSWORD in .env}
@@ -23,7 +23,7 @@ services:
       - ./database/schema_stage1.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
       - ./database/postgres-entrypoint.sh:/postgres-entrypoint.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      test: [ "CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\"" ]
       interval: 4s
       timeout: 3s
       retries: 10
@@ -47,7 +47,7 @@ services:
     volumes:
       - localstack_data:/var/lib/localstack
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
+      test: [ "CMD", "curl", "-f", "http://localhost:4566/_localstack/health" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -67,17 +67,17 @@ services:
       AWS_SECRET_ACCESS_KEY: test
       AWS_DEFAULT_REGION: us-east-1
       MINIO_EVIDENCE_BUCKET: ${MINIO_EVIDENCE_BUCKET:?set MINIO_EVIDENCE_BUCKET in .env}
-    entrypoint: >
-      /bin/sh -c "
-        set -e;
-        aws --endpoint-url=http://localstack:4566 s3api create-bucket --bucket $$MINIO_EVIDENCE_BUCKET;
-        aws --endpoint-url=http://localstack:4566 s3api put-object-lock-configuration
-          --bucket $$MINIO_EVIDENCE_BUCKET
-          --object-lock-configuration '{\"ObjectLockEnabled\":\"Enabled\"}';
-        aws --endpoint-url=http://localstack:4566 s3api get-object-lock-configuration
-          --bucket $$MINIO_EVIDENCE_BUCKET;
-        echo 'WORM Object Lock successfully enforced on bucket $$MINIO_EVIDENCE_BUCKET';
-      "
+    entrypoint: [ "/bin/sh", "-ec" ]
+    command:
+      - |
+        aws --endpoint-url=http://localstack:4566 s3api create-bucket --bucket "$$MINIO_EVIDENCE_BUCKET"
+        VERSIONING_STATUS=$$(aws --endpoint-url=http://localstack:4566 s3api get-bucket-versioning --bucket "$$MINIO_EVIDENCE_BUCKET" --query Status --output text)
+        if [ "$$VERSIONING_STATUS" != "Enabled" ]; then
+          aws --endpoint-url=http://localstack:4566 s3api put-bucket-versioning --bucket "$$MINIO_EVIDENCE_BUCKET" --versioning-configuration Status=Enabled
+        fi
+        aws --endpoint-url=http://localstack:4566 s3api put-object-lock-configuration --bucket "$$MINIO_EVIDENCE_BUCKET" --object-lock-configuration '{"ObjectLockEnabled":"Enabled"}'
+        aws --endpoint-url=http://localstack:4566 s3api get-object-lock-configuration --bucket "$$MINIO_EVIDENCE_BUCKET"
+        echo "WORM Object Lock successfully enforced on bucket $$MINIO_EVIDENCE_BUCKET"
 
   backend:
     build:
