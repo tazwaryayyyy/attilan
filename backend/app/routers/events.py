@@ -14,7 +14,7 @@ router = APIRouter(prefix="/events", tags=["Documented Criminal Events & Soft-To
 
 import logging
 
-logger = logging.getLogger("opencase.adversarial")
+logger = logging.getLogger("attilan.adversarial")
 
 
 class EventCreateRequest(BaseModel):

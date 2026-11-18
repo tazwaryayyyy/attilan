@@ -12,7 +12,7 @@ os.environ.setdefault("JWT_ISSUER", "attilan-test-issuer")
 os.environ.setdefault("JWT_AUDIENCE", "attilan-test-audience")
 os.environ.setdefault(
     "DATABASE_URL",
-    "postgresql://api_worker_login:unit_test_password@localhost:5432/opencase_test",
+    "postgresql://api_worker_login:unit_test_password@localhost:5432/attilan_test",
 )
 
 

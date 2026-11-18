@@ -1,12 +1,12 @@
 services:
-  opencase_postgres_test:
+  attilan_postgres_test:
     image: postgis/postgis:17-3.5-alpine
-    container_name: opencase_postgres_test
+    container_name: attilan_postgres_test
     network_mode: bridge
     environment:
       POSTGRES_USER: ${DB_BOOTSTRAP_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_BOOTSTRAP_PASSWORD:-postgres}
-      POSTGRES_DB: ${POSTGRES_DB:-opencase_test}
+      POSTGRES_DB: ${POSTGRES_DB:-attilan_test}
       API_WORKER_PASSWORD: ${API_WORKER_PASSWORD:-ci_worker_password}
       AUDIT_REPLICA_PASSWORD: ${AUDIT_REPLICA_PASSWORD:-ci_audit_replica_password}
     ports:

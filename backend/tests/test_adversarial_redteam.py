@@ -8,7 +8,7 @@ import asyncpg
 from difflib import SequenceMatcher
 from httpx import ASGITransport, AsyncClient
 
-# Imports pointing to OpenCase-BD Application Layers
+# Imports pointing to Attilan Application Layers
 from backend.app.main import app
 from backend.app.services.disambiguation import (
     BengaliDisambiguationEvaluator,
@@ -18,8 +18,8 @@ from backend.app.services.disambiguation import (
 from backend.tests.conftest import auth_headers
 
 # Core connection string to your test PostgreSQL 17 DB containing Stage 1 Schema.
-# You must have your testing container active (e.g., POSTGRES_DB=opencase_test).
-TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "postgres://postgres:postgres@localhost:5432/opencase_test")
+# You must have your testing container active (e.g., POSTGRES_DB=attilan_test).
+TEST_DATABASE_URL = os.getenv("TEST_DATABASE_URL", "postgres://postgres:postgres@localhost:5432/attilan_test")
 
 
 @pytest_asyncio.fixture(scope="function")

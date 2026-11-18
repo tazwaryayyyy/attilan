@@ -8,6 +8,7 @@ services:
         aliases:
           - db_core
           - db-core
+    entrypoint: ["/bin/sh", "/postgres-entrypoint.sh"]
     environment:
       POSTGRES_USER: ${DB_BOOTSTRAP_USER:?set DB_BOOTSTRAP_USER in .env}
       POSTGRES_PASSWORD: ${DB_BOOTSTRAP_PASSWORD:?set DB_BOOTSTRAP_PASSWORD in .env}
@@ -15,8 +16,9 @@ services:
       API_WORKER_PASSWORD: ${API_WORKER_PASSWORD:?set API_WORKER_PASSWORD in .env}
       AUDIT_REPLICA_PASSWORD: ${AUDIT_REPLICA_PASSWORD:?set AUDIT_REPLICA_PASSWORD in .env}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_prod_data:/var/lib/postgresql/data
       - ./database/schema_stage1.sql:/docker-entrypoint-initdb.d/01_schema_stage1.sql:ro
+      - ./database/postgres-entrypoint.sh:/postgres-entrypoint.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
       interval: 5s
@@ -75,6 +77,7 @@ services:
         aliases:
           - fastapi_engine
           - fastapi-engine
+          - backend
     user: "10001:10001"
     read_only: true
     tmpfs:
@@ -175,6 +178,7 @@ networks:
     driver: bridge
 
 volumes:
-  postgres_data:
+  postgres_prod_data:
+    name: attilan_postgres_prod_data
   minio_data:
   broadcaster_data:

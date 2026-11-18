@@ -61,7 +61,7 @@ python -m pip install --no-cache-dir -r backend/requirements.txt
 export JWT_SECRET_KEY='ci-cryptographic-material-placeholder'
 export JWT_ISSUER='attilan-core-idp'
 export JWT_AUDIENCE='attilan-core-client'
-export DATABASE_URL='postgresql://api_worker_login:ci_worker_password@localhost:5432/opencase_test'
+export DATABASE_URL='postgresql://api_worker_login:ci_worker_password@localhost:5432/attilan_test'
 pytest backend/tests -q
 npm --prefix frontend ci
 npm --prefix frontend run build

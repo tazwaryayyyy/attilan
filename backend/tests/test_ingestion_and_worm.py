@@ -53,7 +53,7 @@ class TestWORMStorageCompliance:
         mock_minio.remove_object.side_effect = S3Error(
             code="AccessDenied",
             message="Object WORM locked: The specified object is protected under WORM compliance retention mode.",
-            resource="opencase-evidence-worm/evidence/2026/test_fir.pdf",
+            resource="attilan-evidence-worm/evidence/2026/test_fir.pdf",
             request_id="17E5E3D0A8B",
             host_id="minio1",
             response=None,
@@ -105,7 +105,7 @@ class TestIngestAPIWorkflow:
         mock_conn.fetchrow.return_value = {
             "source_id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
             "ingestion_timestamp": datetime(2026, 5, 12, 10, 0, 0),
-            "storage_uri": "s3://opencase-evidence-worm/evidence/2026/sample.pdf",
+            "storage_uri": "s3://attilan-evidence-worm/evidence/2026/sample.pdf",
         }
 
         @asynccontextmanager

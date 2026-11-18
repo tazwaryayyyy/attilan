@@ -1,4 +1,4 @@
--- OpenCase-BD: High-Assurance Criminal Intelligence & Evidence Integrity Platform
+-- Attilan: High-Assurance Criminal Intelligence & Evidence Integrity Platform
 -- Stage 1: Database Initialization, Cryptographic Ledger, and Row-Level Security
 -- Targeted Engine: PostgreSQL 17 + PostGIS + pgcrypto
 
@@ -32,6 +32,12 @@ DO $$ BEGIN
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'audit_replica_login') THEN
         CREATE ROLE audit_replica_login LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'attilan_admin') THEN
+        CREATE ROLE attilan_admin SUPERUSER LOGIN;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'attilan_bootstrap') THEN
+        CREATE ROLE attilan_bootstrap SUPERUSER LOGIN;
     END IF;
 END $$;
 
